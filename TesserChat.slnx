@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TesserChat.Client/TesserChat.Client.csproj" />
+    <Project Path="src/TesserChat.Server/TesserChat.Server.csproj" />
+    <Project Path="src/TesserChat.Shared/TesserChat.Shared.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TesserChat.Client.Tests/TesserChat.Client.Tests.csproj" />
+    <Project Path="tests/TesserChat.Server.Tests/TesserChat.Server.Tests.csproj" />
+    <Project Path="tests/TesserChat.Shared.Tests/TesserChat.Shared.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,56 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+# Test results
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+.nuget/
+
+# Publish / packaging
+publish/
+*.[Pp]ublish.xml
+*.pubxml
+*.pubxml.user
+Releases/
+
+# Local secrets & config.
+# Real appsettings files stay on the machine that runs the server — they hold deployment secrets.
+# appsettings.example.json is the tracked template documenting which keys exist.
+appsettings.json
+appsettings.*.json
+!appsettings.example.json
+*.env
+.env.*
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local development notes
+CLAUDE.md
