@@ -1,0 +1,5 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Wire-protocol DTOs and crypto helpers shared by client and server. -->
+
+</Project>
