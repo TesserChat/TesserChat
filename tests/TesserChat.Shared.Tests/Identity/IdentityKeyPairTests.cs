@@ -7,7 +7,7 @@ namespace TesserChat.Shared.Tests.Identity;
 
 /// <summary>
 /// Covers generation, signing, and key agreement. Negative cases are the substance here: a signature
-/// check that never fails is indistinguishable from one that always passes (§0.1).
+/// check that never fails is indistinguishable from one that always passes.
 /// </summary>
 public sealed class IdentityKeyPairTests
 {
@@ -22,7 +22,7 @@ public sealed class IdentityKeyPairTests
         Assert.Equal(IdentityKeyPair.PublicKeySize, identity.Public.EncryptionKey.Length);
 
         // The signing and encryption keys must be independently generated, never one derived from
-        // the other — that separation is the §4.1 key-hygiene requirement.
+        // the other: reusing one key across two algorithms means a flaw in either implicates both.
         Assert.False(identity.Public.SigningKey.SequenceEqual(identity.Public.EncryptionKey));
     }
 
@@ -78,8 +78,8 @@ public sealed class IdentityKeyPairTests
 
         var signature = signer.Sign(Message);
 
-        // The core auth property (§4.7): a valid signature proves possession of one specific
-        // private key, and does not verify under anyone else's public key.
+        // The core auth property: a valid signature proves possession of one specific private
+        // key, and does not verify under anyone else's public key.
         Assert.False(IdentityKeyPair.Verify(impostor.Public, Message, signature));
     }
 
@@ -137,7 +137,7 @@ public sealed class IdentityKeyPairTests
         using var bobKey = bob.DeriveSharedKey(alice.Public);
 
         // Proven by use rather than by comparing key bytes: what actually matters is that a message
-        // Alice encrypts is one Bob can decrypt (§7.1).
+        // Alice encrypts is one Bob can decrypt.
         var aead = AeadAlgorithm.XChaCha20Poly1305;
         var nonce = new byte[aead.NonceSize];
         RandomNumberGenerator.Fill(nonce);
@@ -164,7 +164,7 @@ public sealed class IdentityKeyPairTests
         using var first = alice.DeriveSharedKey(bob.Public);
         var ciphertext = aead.Encrypt(first, nonce, ReadOnlySpan<byte>.Empty, plaintext);
 
-        // §7.1 caches the derived secret per peer, which is only safe if re-deriving gives the
+        // Clients cache the derived secret per peer, which is only safe if re-deriving gives the
         // same key — otherwise a cached key would silently stop matching fresh ones.
         using var second = alice.DeriveSharedKey(bob.Public);
         var decrypted = aead.Decrypt(second, nonce, ReadOnlySpan<byte>.Empty, ciphertext);
@@ -223,8 +223,8 @@ public sealed class IdentityKeyPairTests
 
         using var restored = IdentityKeyPair.FromPrivateKeys(signingPrivate, encryptionPrivate);
 
-        // This is the multi-device story (§4.4) and the backup-restore path (§4.5): the same private
-        // key must yield the same public identity and therefore the same account on every server.
+        // This is the multi-device story and the backup-restore path: the same private key must
+        // yield the same public identity, and therefore the same account on every server.
         Assert.Equal(original.AccountId, restored.AccountId);
         Assert.True(original.Public.SigningKey.SequenceEqual(restored.Public.SigningKey));
         Assert.True(original.Public.EncryptionKey.SequenceEqual(restored.Public.EncryptionKey));
@@ -239,7 +239,7 @@ public sealed class IdentityKeyPairTests
         using var restored = IdentityKeyPair.FromPrivateKeys(signingPrivate, encryptionPrivate);
         var signature = restored.Sign(Message);
 
-        // A restored identity must be able to log in (§4.7) against the original's public key.
+        // A restored identity must be able to log in against the original's public key.
         Assert.True(IdentityKeyPair.Verify(original.Public, Message, signature));
     }
 
@@ -260,7 +260,7 @@ public sealed class IdentityKeyPairTests
         using var bobKey = bob.DeriveSharedKey(alice.Public);
         var ciphertext = aead.Encrypt(bobKey, nonce, ReadOnlySpan<byte>.Empty, plaintext);
 
-        // Restoring a key on a second device must unlock existing DM history (§4.4, §7.3).
+        // Restoring a key on a second device must unlock existing direct-message history.
         using var restoredKey = restoredAlice.DeriveSharedKey(bob.Public);
         Assert.Equal(plaintext, aead.Decrypt(restoredKey, nonce, ReadOnlySpan<byte>.Empty, ciphertext));
     }

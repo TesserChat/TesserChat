@@ -5,7 +5,7 @@ namespace TesserChat.Shared.Identity;
 
 /// <summary>
 /// A complete TesserChat identity: an Ed25519 signing keypair and an X25519 encryption keypair,
-/// generated and held together (§4.1).
+/// generated and held together. See docs/ARCHITECTURE.md §4.1.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -16,8 +16,7 @@ namespace TesserChat.Shared.Identity;
 /// <para>
 /// <b>This holds live private key material.</b> It owns unmanaged key handles and must be disposed.
 /// Nothing here writes to disk: persisting an identity to the OS keystore is a separate concern
-/// (§4.2 step 2) and is not implemented yet, so an identity currently lives only as long as the
-/// process does.
+/// and is not implemented yet, so an identity currently lives only as long as the process does.
 /// </para>
 /// </remarks>
 public sealed class IdentityKeyPair : IDisposable
@@ -50,11 +49,13 @@ public sealed class IdentityKeyPair : IDisposable
     /// <summary>The public half of this identity — safe to publish, share, and persist.</summary>
     public PublicIdentity Public { get; }
 
-    /// <summary>This identity's permanent account id (§5.1).</summary>
+    /// <summary>
+    /// This identity's permanent account id on any server, derived from the signing key.
+    /// </summary>
     public Guid AccountId => Public.AccountId;
 
     /// <summary>
-    /// Generates a brand-new identity: two fresh keypairs from the platform CSPRNG (§4.2 step 1).
+    /// Generates a brand-new identity: two fresh keypairs from the platform CSPRNG.
     /// </summary>
     public static IdentityKeyPair Generate()
     {
@@ -83,9 +84,9 @@ public sealed class IdentityKeyPair : IDisposable
     /// Reconstructs an identity from previously exported private key seeds.
     /// </summary>
     /// <remarks>
-    /// This is the path the OS-keystore read (§4.2) and the encrypted-backup import (§4.5) will
-    /// use. It takes the private halves only — both public keys are recomputed from them, so a
-    /// stored public key can never disagree with the private key it claims to match.
+    /// This is the path the OS-keystore read and the encrypted-backup import will use. It takes
+    /// the private halves only — both public keys are recomputed from them, so a stored public key
+    /// can never disagree with the private key it claims to match.
     /// </remarks>
     /// <exception cref="ArgumentException">Either seed is the wrong length.</exception>
     /// <exception cref="CryptographicException">Either seed is not valid key material.</exception>
@@ -136,7 +137,8 @@ public sealed class IdentityKeyPair : IDisposable
     /// Signs <paramref name="data"/> with this identity's Ed25519 key.
     /// </summary>
     /// <remarks>
-    /// Used for the login challenge-response (§4.7). Callers must sign a payload that binds the
+    /// Used for the login challenge-response: the client proves it holds the private key by
+    /// signing a short-lived nonce the server issued. Callers must sign a payload that binds the
     /// target server, so a captured signature cannot be replayed against a different one.
     /// </remarks>
     public byte[] Sign(ReadOnlySpan<byte> data)
@@ -183,7 +185,7 @@ public sealed class IdentityKeyPair : IDisposable
 
     /// <summary>
     /// Performs X25519 ECDH against a peer's encryption key and derives the symmetric key used to
-    /// encrypt DMs with that peer (§7.1).
+    /// encrypt direct messages with that peer.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -194,11 +196,13 @@ public sealed class IdentityKeyPair : IDisposable
     /// <para>
     /// Both sides derive the same key: ECDH is symmetric and the HKDF inputs here are fixed. That
     /// symmetry is what lets two clients talk without a handshake. It also means these are static
-    /// long-term keys with <b>no forward secrecy</b> — a deliberate v1 tradeoff (§7.1). Compromise
-    /// of one private key retroactively decrypts every DM that identity ever exchanged.
+    /// long-term keys with <b>no forward secrecy</b> — a deliberate v1 tradeoff, since a proper
+    /// Double Ratchet has no mature .NET implementation. Compromise of one private key
+    /// retroactively decrypts every DM that identity ever exchanged.
     /// </para>
     /// <para>
-    /// The result is safe to cache per peer, which §7.1 calls for.
+    /// Deriving this is not free and the inputs never change, so the result is intended to be
+    /// cached per peer after the first computation.
     /// </para>
     /// </remarks>
     /// <returns>A key suitable for XChaCha20-Poly1305. The caller owns and must dispose it.</returns>
@@ -239,7 +243,7 @@ public sealed class IdentityKeyPair : IDisposable
     }
 
     /// <summary>
-    /// Derives the DM key for a peer identity (§7.1).
+    /// Derives the direct-message key for a peer identity.
     /// </summary>
     public Key DeriveSharedKey(PublicIdentity peer)
     {
@@ -252,9 +256,9 @@ public sealed class IdentityKeyPair : IDisposable
     /// </summary>
     /// <remarks>
     /// <b>Handle with care.</b> These bytes are the identity — anyone holding them can sign as this
-    /// user and decrypt every DM it has ever received. This exists for the OS-keystore write (§4.2)
-    /// and the encrypted backup (§4.5); it must never be logged, sent to a server, or written to
-    /// disk unencrypted. Callers should clear the arrays when finished.
+    /// user and decrypt every DM it has ever received. This exists so the identity can be written
+    /// to the OS keystore or into an encrypted backup; it must never be logged, sent to a server,
+    /// or written to disk unencrypted. Callers should clear the arrays when finished.
     /// </remarks>
     public (byte[] SigningPrivateKey, byte[] EncryptionPrivateKey) ExportPrivateKeys()
     {
@@ -280,9 +284,9 @@ public sealed class IdentityKeyPair : IDisposable
     }
 
     /// <summary>
-    /// Keys are created exportable so the encrypted-backup flow (§4.5) and the OS-keystore write
-    /// (§4.2) can reach the private bytes. NSec fixes this policy at creation — it cannot be
-    /// relaxed afterwards, so a non-exportable key could never be backed up.
+    /// Keys are created exportable so the encrypted-backup flow and the OS-keystore write can
+    /// reach the private bytes. NSec fixes this policy at creation — it cannot be relaxed
+    /// afterwards, so a non-exportable key could never be backed up.
     /// </summary>
     private static KeyCreationParameters CreationParameters => new()
     {

@@ -10,12 +10,13 @@ namespace TesserChat.Shared.Identity;
 /// <para>
 /// Servers key everything internal off this value — permissions, message authorship, the audit
 /// trail — rather than off the display name, which is cosmetic and freely changeable.
+/// See docs/ARCHITECTURE.md §5.1.
 /// </para>
 /// <para>
 /// Derivation is a domain-separated SHA-256 over the raw public key, truncated to 16 bytes and
 /// shaped into a RFC 4122 version 8 (custom) UUID. Truncating a hash to 128 bits is sound here:
 /// this identifies an account, it is not a security boundary. Possession of the private key is
-/// what authenticates (§4.7); a collision would let two identities share a row, not let one
+/// what authenticates a login; a collision would let two identities share a row, not let one
 /// impersonate the other's signatures.
 /// </para>
 /// <para>

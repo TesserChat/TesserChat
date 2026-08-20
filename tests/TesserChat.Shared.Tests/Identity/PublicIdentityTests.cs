@@ -3,8 +3,8 @@ using TesserChat.Shared.Identity;
 namespace TesserChat.Shared.Tests.Identity;
 
 /// <summary>
-/// Covers the public half of an identity: the shareable token (§8.1), the displayed fingerprint
-/// (§4.2 step 3), and identity equality.
+/// Covers the public half of an identity: the shareable "add friend" token, the fingerprint shown
+/// to the user, and identity equality.
 /// </summary>
 public sealed class PublicIdentityTests
 {

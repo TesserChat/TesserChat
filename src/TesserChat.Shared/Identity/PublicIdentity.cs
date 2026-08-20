@@ -7,9 +7,9 @@ namespace TesserChat.Shared.Identity;
 /// </summary>
 /// <remarks>
 /// <para>
-/// This is the shape that travels — published to a server on join, exchanged so a DM partner can
-/// discover an encryption key (§7.1), and encoded into an "add friend" string (§8.1). It contains
-/// no secret material and is safe to persist, log, or hand to anyone.
+/// This is the shape that travels — published to a server on join, exchanged so a direct-message
+/// partner can discover an encryption key, and encoded into an "add friend" string. It contains no
+/// secret material and is safe to persist, log, or hand to anyone.
 /// </para>
 /// <para>
 /// Both keys are carried together deliberately. A peer needs the Ed25519 key to verify what the
@@ -48,20 +48,20 @@ public sealed class PublicIdentity : IEquatable<PublicIdentity>
         AccountId = Identity.AccountId.FromPublicKey(_signingKey);
     }
 
-    /// <summary>Raw Ed25519 public key — verifies this identity's signatures (§4.7).</summary>
+    /// <summary>Raw Ed25519 public key — verifies this identity's signatures.</summary>
     public ReadOnlySpan<byte> SigningKey => _signingKey;
 
-    /// <summary>Raw X25519 public key — the DM key-exchange half (§7.1).</summary>
+    /// <summary>Raw X25519 public key — the direct-message key-exchange half.</summary>
     public ReadOnlySpan<byte> EncryptionKey => _encryptionKey;
 
     /// <summary>
-    /// This identity's permanent account id, derived from <see cref="SigningKey"/> (§5.1).
+    /// This identity's permanent account id, derived from <see cref="SigningKey"/>.
     /// </summary>
     public Guid AccountId { get; }
 
     /// <summary>
     /// Encodes both keys into a single self-contained token — the form used for "add friend"
-    /// strings (§8.1) and for known-server/contact export files (§9.5).
+    /// strings and for contact export files.
     /// </summary>
     /// <remarks>
     /// Base64url, so the token survives being pasted into a URL, a chat message, or a filename
@@ -114,8 +114,8 @@ public sealed class PublicIdentity : IEquatable<PublicIdentity>
     }
 
     /// <summary>
-    /// A short, human-comparable rendering of the signing key, for the fingerprint the client shows
-    /// the user (§4.2 step 3) and for out-of-band verification against a contact.
+    /// A short, human-comparable rendering of the signing key, for the fingerprint the client
+    /// shows the user and for out-of-band verification against a contact.
     /// </summary>
     /// <remarks>
     /// Groups of four hex characters, since people compare these visually and unbroken 64-character

@@ -3,7 +3,7 @@ using TesserChat.Shared.Identity;
 namespace TesserChat.Shared.Tests.Identity;
 
 /// <summary>
-/// Covers the public-key → account UUID derivation (§5.1).
+/// Covers the public-key → account UUID derivation.
 /// </summary>
 /// <remarks>
 /// Determinism is the property under test throughout. This id is an account's permanent primary
