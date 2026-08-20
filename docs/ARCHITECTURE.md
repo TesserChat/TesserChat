@@ -34,6 +34,14 @@ implementation.
     cover permission resolution generally, not just behavior of the 3 default roles.
   - Offline mailbox dedup/ack/TTL logic (§7.4) — this has real edge cases (duplicate timestamps,
     partial ack across multiple queuing servers) that look correct until they aren't.
+  - The recipient membership check (§7.4.1) — cover the rejection path explicitly, not just the
+    accept path: a non-member recipient is discarded rather than queued, a membership revoked
+    between enqueue and delivery stops delivery, and the rejection is not distinguishable to the
+    sender from a successful queue.
+  - Client-side blocking and first contact (§7.5) — the ordering is the thing to test: a forged
+    sender field fails to decrypt and never reaches the block check or the UI; a blocked sender's
+    message is dropped after decryption but still acked; an unknown sender produces a prompt
+    carrying no message content; and a known sender bypasses the prompt entirely.
 - Avalonia ViewModels (MVVM) are unit-testable independent of the view — test those. Full UI/visual
   testing is lower priority for v1 (Avalonia has a headless test mode if that becomes worth the
   investment later; don't block on it now).
@@ -382,6 +390,12 @@ Rooms are intentionally **not** E2E encrypted (open community chat). DMs are, al
 - **No forward secrecy in v1** (accepted tradeoff — a proper Double Ratchet has no mature .NET
   library and would need to be hand-built against the published spec; revisit post-v1 if it
   becomes a priority).
+- The envelope carries the **claimed sender X25519 public key** in cleartext alongside the
+  ciphertext. The recipient needs it to know which shared secret to derive — with static per-person
+  keys there is no session to look it up from. It is a *claim*, not a credential: it is trusted only
+  once decryption succeeds, since the AEAD tag verifies only for the real holder of that key
+  (§7.5.1). The server sees this field, so it learns that two keys are corresponding even though it
+  cannot read what they say.
 
 ### 7.2 Routing
 - A DM can only be sent while the two users share at least one server (that server carries the
@@ -398,19 +412,21 @@ thread even if the pair later moves to messaging through a different shared serv
 ### 7.4 Offline Mailbox (queued delivery)
 When the recipient isn't currently reachable:
 1. Sender's client fans the encrypted message out to **every server it shares with the
-   recipient** — i.e., servers where the recipient is also a member, not literally every server the
-   sender happens to be connected to (queuing on a server the recipient will never visit achieves
-   nothing — **flagging this as the assumed scope; confirm/correct if intended differently**).
-2. Each receiving server stores the ciphertext blob in a transient queue table, keyed by recipient
+   recipient** — servers where the recipient is also a member, not every server the sender happens
+   to be connected to. Queuing on a server the recipient will never visit achieves nothing.
+2. **Each receiving server independently verifies that the recipient UUID is a member of that
+   server, and discards the message outright if not** (see §7.4.1). The sender's fan-out targeting
+   is a client-side intention; this check is the server-side enforcement of it.
+3. Each receiving server stores the ciphertext blob in a transient queue table, keyed by recipient
    UUID, **Unix-timestamped**.
-3. When a server observes the recipient's next heartbeat/connect, it delivers any queued
+4. When a server observes the recipient's next heartbeat/connect, it delivers any queued
    message(s) for them.
-4. Recipient's client dedupes: a message with a timestamp it's already seen/displayed is discarded
+5. Recipient's client dedupes: a message with a timestamp it's already seen/displayed is discarded
    rather than shown twice (since the same message may have been queued on several shared servers).
-5. Client acknowledges receipt back to whichever server delivered it; that server clears its queue
+6. Client acknowledges receipt back to whichever server delivered it; that server clears its queue
    entry for that message.
 
-**Two implementation notes worth building in from the start, not just discovered later:**
+**Queue-handling notes worth building in from the start, not just discovered later:**
 - The client should **ack even messages it discards as duplicates** — otherwise the *other* servers
   that also queued a copy never learn it's safe to clear their queue, and it sits there forever.
 - Add a **TTL-based garbage-collection backstop** on the queue table regardless (e.g. purge queued
@@ -420,12 +436,108 @@ When the recipient isn't currently reachable:
   timestamp alone — two distinct messages sent in the same millisecond is a real (if rare) edge
   case the timestamp-only scheme doesn't handle. Optional hardening, not blocking v1.
 
-### 7.5 Blocking & Abuse
-Friend-add requires no mutual approval (§8.1) — the corresponding responsibility falls on
-**blocking**. Client-side filtering of a blocked pubkey's messages is the minimum bar; whether the
-server should also honor block lists to prevent a blocked user from still filling up shared
-servers' offline-queue storage is an open question worth resolving before the mailbox queue ships
-(currently backlog).
+#### 7.4.1 Recipient Membership Check (server-side, mandatory)
+
+Before a server accepts a relayed or queued DM, it resolves the destination public key to a local
+account and confirms that account is a **member of this server**. If it is not, the message is
+**discarded immediately** — not queued, not held pending a future join.
+
+This matters because the fan-out in step 1 is decided entirely by the *sender's* client, from the
+sender's own view of which servers it shares with the recipient. That view can be stale, wrong, or
+deliberately falsified. Without this check, any client could push arbitrary ciphertext blobs into
+the queue table of any server it can reach, addressed to users who will never collect them —
+unbounded write access to someone else's storage, from an unprivileged account. The check turns the
+queue into something a server only holds on behalf of its own members.
+
+Notes on the check itself:
+
+- **Discard silently; do not report back whether the recipient is a member.** A per-server "is this
+  pubkey here?" oracle would turn every server into a membership-enumeration endpoint for arbitrary
+  keys, which is exactly the boundary §8.2 draws around presence. The sender's client already knows
+  which servers it believes are shared and does not need the confirmation.
+- **Discarding is not an error the sender needs to act on.** The message is fanned out to every
+  shared server precisely so that any one of them can deliver it; a server correctly dropping a
+  message it should never have received is normal operation, not a failure. Do not surface it to
+  the user, and do not let it fail the send.
+- **Check at enqueue, and again at delivery.** Membership can be revoked between the two — someone
+  is kicked, or leaves — and a message queued while they were a member should not be delivered
+  afterwards. Re-checking at delivery also purges entries stranded by a membership change.
+- **This check is about membership, not blocking.** Blocking is client-side (§7.5.1) — the server
+  cannot evaluate a block list because it cannot tell who an encrypted DM is from. Should
+  server-side enforcement ever land (backlog, §7.5.3), this is the pipeline position for it.
+- **The check is on the recipient, not the sender.** A server relays for members; it does not
+  require the *sender* to be a member of that server. Whether it should is a separate question tied
+  to abuse handling (§7.5) — flagged, not settled here.
+
+### 7.5 Blocking, First Contact & Abuse
+
+Friend-add requires no mutual approval (§8.1), so the corresponding responsibility falls on
+**blocking and on how unknown senders are surfaced**. Both are **client-side** decisions.
+
+#### 7.5.1 Blocking is client-side
+
+The server cannot evaluate a block list, because it cannot tell who a DM is from. The payload is
+end-to-end encrypted (§7.1) and the server holds no key that opens it. Only the recipient's client
+can establish the sender's identity, so only the recipient's client can act on one.
+
+On receiving a DM, the client:
+
+1. Reads the **claimed sender public key** from the envelope and derives the shared secret for it.
+2. **Decrypts.** Success is what authenticates the claim — an XChaCha20-Poly1305 tag only verifies
+   if the message really was sealed by the holder of that private key, so a forged sender field
+   fails here rather than being believed. A failed decrypt is discarded and never shown.
+3. **Checks the now-authenticated sender against the block list**, and discards the message if
+   blocked — before it reaches the UI, notifications, or unread counts.
+
+Order matters: the block check comes *after* decryption, never before. Trusting the envelope's
+unauthenticated sender field would let anyone bypass a block by putting someone else's key in it,
+and would equally let them forge a message as a trusted contact.
+
+A blocked sender's message is **dropped silently**. No delivery failure, no "you have been blocked"
+signal, no read receipt — blocking should not tell the blocked party they were blocked. The client
+still **acks the message to the relaying server** exactly as it would a duplicate (§7.4), so the
+server clears its queue entry rather than retaining and retrying it forever.
+
+#### 7.5.2 First contact from an unknown sender
+
+A message from a public key the user has never corresponded with is **not shown as an ordinary
+message**. Delivering unsolicited content straight into the conversation list is what makes
+unsolicited-message abuse effective, and the no-approval friend model (§8.1) means anyone who
+learns a public key can send.
+
+Instead the client surfaces a **first-contact prompt** identifying the sender by fingerprint (§4.2)
+and offering exactly three actions:
+
+- **View** — open the message and treat this pubkey as known from now on, so subsequent messages
+  arrive normally without re-prompting.
+- **Discard** — drop this message. The sender stays unknown, so a later message prompts again.
+- **Block** — discard and add to the block list, applying §7.5.1 to everything from that key
+  thereafter.
+
+Constraints on the prompt, since it is itself an abuse surface:
+
+- **Show the message only after "View".** The prompt itself must not render message content, or it
+  becomes the delivery vector it exists to prevent. Metadata only: the sender's fingerprint, and
+  optionally which server relayed it.
+- **Collapse repeat prompts per sender.** Many pending messages from one unknown key are one
+  prompt, not one per message, or the prompt queue becomes the abuse channel.
+- **Decrypt before prompting.** The sender is only known once decryption succeeds (§7.5.1), so
+  first-contact classification happens after that step, not on the envelope's claim.
+- **Prompting is not a delivery failure.** Ack to the relaying server as normal, so its queue
+  clears whichever action the user eventually takes.
+- Deciding a pubkey is "known" is local state. A user who has an existing DM thread with someone,
+  or has added them as a friend (§8.1), is past first contact and is never prompted for them.
+
+#### 7.5.3 Storage abuse
+
+The §7.4.1 recipient membership check already bounds who can write into a server's queue — only
+messages addressed to that server's own members are stored at all. Blocking narrows what a
+recipient *sees* but not what a server *holds*, since the server still cannot identify senders.
+
+Whether servers should additionally enforce block lists — which would require exposing sender
+identity to the server and giving up some of the privacy §7.1 buys — remains **backlog**, and is
+now a weaker case than before: membership-scoped queues plus the TTL backstop (§7.4) bound
+retention without it.
 
 ## 8. Friends & Presence
 
@@ -546,6 +658,7 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 - Offline DM mailbox (fan-out queue, per §7.4)
 - Push presence (SignalR groups)
 - Friends (add-by-pubkey, no approval, block instead)
+- Client-side blocking and the first-contact prompt for unknown senders (§7.5)
 - Encrypted key backup/export
 - Local vault lock with crypto-shred wipe
 - Docker deployment + first-run setup wizard → Owner assignment
