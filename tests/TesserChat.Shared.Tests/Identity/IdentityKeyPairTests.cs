@@ -216,6 +216,21 @@ public sealed class IdentityKeyPairTests
     }
 
     [Fact]
+    public void FromSeed_ReconstructsTheSameIdentity()
+    {
+        using var original = IdentityKeyPair.Generate();
+        var seed = original.ExportSeed();
+
+        using var restored = IdentityKeyPair.FromSeed(seed);
+
+        // The multi-device story and the backup-restore path, both from one secret: the same seed
+        // must yield the same public identity, and therefore the same account on every server.
+        Assert.Equal(original.AccountId, restored.AccountId);
+        Assert.True(original.Public.SigningKey.SequenceEqual(restored.Public.SigningKey));
+        Assert.True(original.Public.EncryptionKey.SequenceEqual(restored.Public.EncryptionKey));
+    }
+
+    [Fact]
     public void FromPrivateKeys_ReconstructsTheSameIdentity()
     {
         using var original = IdentityKeyPair.Generate();
@@ -223,20 +238,136 @@ public sealed class IdentityKeyPairTests
 
         using var restored = IdentityKeyPair.FromPrivateKeys(signingPrivate, encryptionPrivate);
 
-        // This is the multi-device story and the backup-restore path: the same private key must
-        // yield the same public identity, and therefore the same account on every server.
         Assert.Equal(original.AccountId, restored.AccountId);
         Assert.True(original.Public.SigningKey.SequenceEqual(restored.Public.SigningKey));
         Assert.True(original.Public.EncryptionKey.SequenceEqual(restored.Public.EncryptionKey));
     }
 
     [Fact]
-    public void FromPrivateKeys_RestoredIdentityProducesVerifiableSignatures()
+    public void FromSeed_IsDeterministicAcrossDevices()
+    {
+        var seed = RandomNumberGenerator.GetBytes(IdentityKeyPair.SeedSize);
+
+        using var deviceA = IdentityKeyPair.FromSeed(seed);
+        using var deviceB = IdentityKeyPair.FromSeed(seed);
+
+        // Importing the same backup on a second device must produce a byte-identical identity —
+        // both keys, not just the signing one.
+        Assert.Equal(deviceA.AccountId, deviceB.AccountId);
+        Assert.True(deviceA.Public.SigningKey.SequenceEqual(deviceB.Public.SigningKey));
+        Assert.True(deviceA.Public.EncryptionKey.SequenceEqual(deviceB.Public.EncryptionKey));
+    }
+
+    [Fact]
+    public void FromSeed_DerivesTwoDistinctKeys()
+    {
+        var seed = RandomNumberGenerator.GetBytes(IdentityKeyPair.SeedSize);
+
+        using var identity = IdentityKeyPair.FromSeed(seed);
+
+        // Derived from one seed, but they must not collapse into the same key: they are used with
+        // different algorithms and must stay separable.
+        Assert.False(identity.Public.SigningKey.SequenceEqual(identity.Public.EncryptionKey));
+    }
+
+    [Fact]
+    public void FromSeed_DerivesTheEncryptionKeyRatherThanReusingTheSeed()
+    {
+        var seed = RandomNumberGenerator.GetBytes(IdentityKeyPair.SeedSize);
+
+        using var identity = IdentityKeyPair.FromSeed(seed);
+        var (_, encryptionPrivate) = identity.ExportPrivateKeys();
+
+        // Guards the HKDF step: handing the raw seed to X25519 unchanged would make the encryption
+        // private key equal the signing private key, defeating the separation entirely.
+        Assert.False(encryptionPrivate.AsSpan().SequenceEqual(seed));
+    }
+
+    [Fact]
+    public void FromSeed_DifferentSeedsProduceDifferentIdentities()
+    {
+        using var first = IdentityKeyPair.FromSeed(RandomNumberGenerator.GetBytes(IdentityKeyPair.SeedSize));
+        using var second = IdentityKeyPair.FromSeed(RandomNumberGenerator.GetBytes(IdentityKeyPair.SeedSize));
+
+        Assert.NotEqual(first.AccountId, second.AccountId);
+        Assert.False(first.Public.EncryptionKey.SequenceEqual(second.Public.EncryptionKey));
+    }
+
+    [Fact]
+    public void FromSeed_ProducesAKnownEncryptionKeyForAKnownSeed()
+    {
+        // Pins the seed -> X25519 derivation, which is frozen wire format. If the HKDF info string,
+        // hash, or input ever changes, every restored identity silently derives a different
+        // encryption key and can no longer decrypt existing direct messages — with no error at
+        // restore time to signal it happened.
+        //
+        // The expected value was computed independently of this codebase and of NSec, so it pins
+        // the specified construction rather than echoing the implementation:
+        //   priv = HKDF-SHA256(ikm: 32 zero bytes, salt: none,
+        //                      info: "tesserchat:x25519-from-ed25519-seed:v1")
+        //        = 837d9c561dc7e8612e2fb59b83504c5aa899f2906e7b6e4fc97a754503eaa676
+        //   pub  = X25519(clamp(priv), 9)   per RFC 7748
+        var seed = new byte[IdentityKeyPair.SeedSize];
+
+        using var identity = IdentityKeyPair.FromSeed(seed);
+
+        Assert.Equal(
+            "ec61026e0cadaa34c89766ce5715903a6e3b98a4fb8ed7fb09a894ef6e0fc328",
+            Convert.ToHexStringLower(identity.Public.EncryptionKey));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(31)]
+    [InlineData(33)]
+    [InlineData(64)]
+    public void FromSeed_RejectsAWrongLengthSeed(int seedLength)
+    {
+        Assert.Throws<ArgumentException>(() => IdentityKeyPair.FromSeed(new byte[seedLength]));
+    }
+
+    [Fact]
+    public void ExportSeed_RoundTripsThroughFromSeed()
     {
         using var original = IdentityKeyPair.Generate();
-        var (signingPrivate, encryptionPrivate) = original.ExportPrivateKeys();
 
-        using var restored = IdentityKeyPair.FromPrivateKeys(signingPrivate, encryptionPrivate);
+        var seed = original.ExportSeed();
+        using var restored = IdentityKeyPair.FromSeed(seed);
+
+        Assert.Equal(IdentityKeyPair.SeedSize, seed.Length);
+        Assert.Equal(original.AccountId, restored.AccountId);
+    }
+
+    [Fact]
+    public void ExportSeed_RestoredIdentityDecryptsExistingDirectMessages()
+    {
+        using var alice = IdentityKeyPair.Generate();
+        using var bob = IdentityKeyPair.Generate();
+        var seed = alice.ExportSeed();
+
+        var aead = AeadAlgorithm.XChaCha20Poly1305;
+        var nonce = new byte[aead.NonceSize];
+        RandomNumberGenerator.Fill(nonce);
+        var plaintext = Encoding.UTF8.GetBytes("sent before the device was replaced");
+
+        using var bobKey = bob.DeriveSharedKey(alice.Public);
+        var ciphertext = aead.Encrypt(bobKey, nonce, ReadOnlySpan<byte>.Empty, plaintext);
+
+        // The whole point of the single-seed design: restoring one secret on a new device must
+        // unlock history, which only works if the derived encryption key is reproduced exactly.
+        using var restoredAlice = IdentityKeyPair.FromSeed(seed);
+        using var restoredKey = restoredAlice.DeriveSharedKey(bob.Public);
+
+        Assert.Equal(plaintext, aead.Decrypt(restoredKey, nonce, ReadOnlySpan<byte>.Empty, ciphertext));
+    }
+
+    [Fact]
+    public void FromSeed_RestoredIdentityProducesVerifiableSignatures()
+    {
+        using var original = IdentityKeyPair.Generate();
+        var seed = original.ExportSeed();
+
+        using var restored = IdentityKeyPair.FromSeed(seed);
         var signature = restored.Sign(Message);
 
         // A restored identity must be able to log in against the original's public key.
@@ -277,7 +408,7 @@ public sealed class IdentityKeyPairTests
     }
 
     [Fact]
-    public void ExportPrivateKeys_ReturnsSeedsOfTheExpectedSize()
+    public void ExportPrivateKeys_ReturnsKeysOfTheExpectedSize()
     {
         using var identity = IdentityKeyPair.Generate();
 
@@ -307,6 +438,7 @@ public sealed class IdentityKeyPairTests
         identity.Dispose();
 
         Assert.Throws<ObjectDisposedException>(() => identity.Sign(Message));
+        Assert.Throws<ObjectDisposedException>(() => identity.ExportSeed());
         Assert.Throws<ObjectDisposedException>(() => identity.ExportPrivateKeys());
         Assert.Throws<ObjectDisposedException>(() => identity.DeriveSharedKey(peer.Public));
     }

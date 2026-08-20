@@ -212,13 +212,35 @@ only record of which keys exist.
 ## 4. Identity & Auth
 
 ### 4.1 Keys
-Every identity is **two keypairs**, generated and stored together:
+Every identity is **one 32-byte master seed** that expands into **two keypairs**:
 - **Ed25519** — signing, used for the login challenge-response and as the account's permanent ID.
-- **X25519** — encryption, used only for DM key exchange (see §7). Kept separate from the signing
-  key as a matter of key-hygiene, even though a mathematical Ed25519→X25519 conversion exists.
+  The seed *is* this key's private key.
+- **X25519** — encryption, used only for DM key exchange (see §7). Derived from the seed via
+  `HKDF-SHA256(ikm: seed, salt: none, info: "tesserchat:x25519-from-ed25519-seed:v1")`.
+
+**Why one seed rather than two independent keys.** The user has to move and safeguard this material
+across devices and backups. One secret means one file, one passphrase, and no possibility of a
+backup that restores half an identity — the failure mode where a user recovers their login but
+silently loses the ability to decrypt their DM history. Two independently generated keys bought a
+key-hygiene property that was never real in practice, since both keys always shared one keystore
+entry and one backup file anyway.
+
+**The two keys are therefore not independent secrets** — anyone holding the seed can derive the
+encryption key. What is retained is the separation that actually matters: two distinct keys used
+with two distinct algorithms, so a flaw or misuse in either does not implicate the other.
+
+**This is key derivation, not curve conversion.** HKDF produces 32 deterministic bytes, which
+X25519 accepts as a private key because it clamps the scalar internally. The Ed25519→X25519
+birational map exists in libsodium but is *not* exposed by NSec, and hand-writing curve arithmetic
+in the project's most security-sensitive code would be a poor trade for the 32 bytes it saves.
+
+> **Frozen wire format.** The HKDF info string above must never change. Changing it makes every
+> restored identity derive a different encryption key, breaking decryption of all existing direct
+> messages — with no error at restore time to signal that it happened. A test pins the derivation
+> against a vector computed independently of NSec (RFC 7748) to catch any drift.
 
 ### 4.2 New Identity Flow (client-generated — the default path)
-1. Client generates both keypairs via NSec.
+1. Client generates a random 32-byte seed and expands it into both keypairs (§4.1).
 2. Private key material is written **directly into OS-native secure storage** — Keychain (macOS),
    DPAPI/Credential Manager (Windows), Secret Service/libsecret (Linux). A raw private key file is
    never written to disk as part of this flow.
@@ -250,6 +272,10 @@ prevents an account from having multiple registered public keys later if this ne
   maintenance status before locking in.
 - Format: standard `openssh-key-v1` container so it's also readable by normal SSH tooling if
   the user ever wants that.
+- **The container holds the single 32-byte master seed** (§4.1), not two separate keys. That is what
+  keeps the format standard — `openssh-key-v1` has no slot for a second key — and what keeps
+  device-to-device transfer down to one file and one passphrase. The X25519 key is re-derived on
+  import, so a restored identity recovers both its login and its DM history from that one secret.
 
 ### 4.6 Local Vault Lock (failed-attempt wipe)
 Scope: **this only ever triggers on failed local unlock attempts against the on-device encrypted

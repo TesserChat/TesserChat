@@ -9,9 +9,16 @@ namespace TesserChat.Shared.Identity;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The two keypairs are independent. An Ed25519 key can be mathematically converted to X25519, and
-/// this type deliberately does not do that — reusing one key across two algorithms means a flaw or
-/// a misuse in either one implicates the other. Generating two costs a few microseconds once.
+/// The two keys stay distinct and are used with distinct algorithms, so a flaw or misuse in either
+/// one does not implicate the other. They are not, however, independent secrets: an identity has a
+/// single master seed, and the X25519 key is derived from it (see <see cref="FromSeed"/>). That
+/// keeps backup and multi-device transfer down to one secret, which is what the user actually has
+/// to move and safeguard.
+/// </para>
+/// <para>
+/// The derivation uses HKDF, <b>not</b> the Ed25519→X25519 birational map. That conversion exists
+/// in libsodium but is not exposed by NSec, and implementing curve arithmetic by hand in the
+/// project's most security-sensitive code would be a poor trade for the 32 bytes it saves.
 /// </para>
 /// <para>
 /// <b>This holds live private key material.</b> It owns unmanaged key handles and must be disposed.
@@ -29,6 +36,11 @@ public sealed class IdentityKeyPair : IDisposable
 
     /// <summary>Length in bytes of an Ed25519 signature.</summary>
     public const int SignatureSize = 64;
+
+    /// <summary>
+    /// Length in bytes of the master seed that an entire identity is reconstructed from.
+    /// </summary>
+    public const int SeedSize = 32;
 
     private static readonly SignatureAlgorithm SigningAlgorithm = SignatureAlgorithm.Ed25519;
     private static readonly KeyAgreementAlgorithm AgreementAlgorithm = KeyAgreementAlgorithm.X25519;
@@ -55,28 +67,78 @@ public sealed class IdentityKeyPair : IDisposable
     public Guid AccountId => Public.AccountId;
 
     /// <summary>
-    /// Generates a brand-new identity: two fresh keypairs from the platform CSPRNG.
+    /// Generates a brand-new identity from a fresh random seed.
     /// </summary>
     public static IdentityKeyPair Generate()
     {
-        Key? signing = null;
-        Key? encryption = null;
+        Span<byte> seed = stackalloc byte[SeedSize];
+        RandomNumberGenerator.Fill(seed);
         try
         {
-            signing = Key.Create(SigningAlgorithm, CreationParameters);
-            encryption = Key.Create(AgreementAlgorithm, CreationParameters);
-            var identity = new IdentityKeyPair(signing, encryption);
-
-            // Ownership has transferred to the returned instance; don't let the catch dispose them.
-            signing = null;
-            encryption = null;
-            return identity;
+            return FromSeed(seed);
         }
-        catch
+        finally
         {
-            signing?.Dispose();
-            encryption?.Dispose();
-            throw;
+            CryptographicOperations.ZeroMemory(seed);
+        }
+    }
+
+    /// <summary>
+    /// Reconstructs a complete identity from its <see cref="SeedSize"/>-byte master seed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The seed <i>is</i> the identity. The Ed25519 signing key is the seed directly; the X25519
+    /// encryption key is derived from it with HKDF-SHA256 under a fixed domain-separated info
+    /// string. Both are reproduced exactly, so backing up and restoring one 32-byte secret carries
+    /// the whole identity — the user moves a single file with a single passphrase rather than
+    /// tracking two keys that could drift apart or be restored by halves.
+    /// </para>
+    /// <para>
+    /// This is a key-derivation step, not a curve conversion: HKDF simply produces 32 deterministic
+    /// bytes, which X25519 accepts as a private key because it clamps the scalar internally. No
+    /// Ed25519→X25519 birational mapping is involved and no hand-written curve arithmetic exists
+    /// anywhere in this project.
+    /// </para>
+    /// <para>
+    /// <b>The consequence is that the two keys are not independent secrets.</b> Anyone holding the
+    /// seed can derive the encryption key. What survives is the separation that actually matters
+    /// here: two distinct keys used with two distinct algorithms, so neither algorithm's misuse
+    /// implicates the other. Since both keys always shared one keystore entry and one backup file,
+    /// treating them as independent was never true in practice — this makes it explicit.
+    /// </para>
+    /// <para>
+    /// <b><see cref="X25519DerivationInfo"/> is frozen wire format.</b> Changing it makes every
+    /// restored identity derive a different encryption key, silently breaking decryption of all
+    /// existing direct messages.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">The seed is not <see cref="SeedSize"/> bytes.</exception>
+    /// <exception cref="CryptographicException">The seed is not valid key material.</exception>
+    public static IdentityKeyPair FromSeed(ReadOnlySpan<byte> seed)
+    {
+        if (seed.Length != SeedSize)
+        {
+            throw new ArgumentException(
+                $"An identity seed must be {SeedSize} bytes, got {seed.Length}.",
+                nameof(seed));
+        }
+
+        Span<byte> encryptionSeed = stackalloc byte[SeedSize];
+        try
+        {
+            HKDF.DeriveKey(
+                HashAlgorithmName.SHA256,
+                ikm: seed,
+                output: encryptionSeed,
+                salt: null,
+                info: X25519DerivationInfo);
+
+            return FromPrivateKeys(seed, encryptionSeed);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptionSeed);
         }
     }
 
@@ -252,13 +314,40 @@ public sealed class IdentityKeyPair : IDisposable
     }
 
     /// <summary>
-    /// Exports the raw private key seeds.
+    /// Exports the master seed this identity can be reconstructed from.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// This is what the encrypted backup and the OS keystore should store: a single
+    /// <see cref="SeedSize"/>-byte secret that <see cref="FromSeed"/> expands back into the whole
+    /// identity. Storing one secret rather than two removes any possibility of a backup that
+    /// restores half an identity.
+    /// </para>
+    /// <para>
     /// <b>Handle with care.</b> These bytes are the identity — anyone holding them can sign as this
-    /// user and decrypt every DM it has ever received. This exists so the identity can be written
-    /// to the OS keystore or into an encrypted backup; it must never be logged, sent to a server,
-    /// or written to disk unencrypted. Callers should clear the arrays when finished.
+    /// user and decrypt every direct message it has ever received. Never log it, never send it to a
+    /// server, never write it to disk unencrypted, and clear the array as soon as you are done with
+    /// it (<see cref="CryptographicOperations.ZeroMemory"/>).
+    /// </para>
+    /// </remarks>
+    public byte[] ExportSeed()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        // The Ed25519 raw private key is the seed itself, so no separate copy has to be kept alive
+        // in managed memory for the lifetime of the identity.
+        return _signingKey.Export(KeyBlobFormat.RawPrivateKey);
+    }
+
+    /// <summary>
+    /// Exports both raw private keys separately.
+    /// </summary>
+    /// <remarks>
+    /// Prefer <see cref="ExportSeed"/> for backup and keystore writes — one secret is simpler to
+    /// move between devices and cannot be restored by halves. This overload exists for the case
+    /// where the two keys are genuinely independent, which is true of any identity built through
+    /// <see cref="FromPrivateKeys"/> rather than <see cref="FromSeed"/>. The same handling warnings
+    /// as <see cref="ExportSeed"/> apply, twice over.
     /// </remarks>
     public (byte[] SigningPrivateKey, byte[] EncryptionPrivateKey) ExportPrivateKeys()
     {
@@ -298,4 +387,15 @@ public sealed class IdentityKeyPair : IDisposable
     /// ECDH secret; changing it breaks decryption of every existing DM, so treat it as wire format.
     /// </summary>
     private static ReadOnlySpan<byte> DmKeyDerivationInfo => "tesserchat:dm-key:v1"u8;
+
+    /// <summary>
+    /// HKDF info string separating the X25519 encryption key from the seed it is derived from.
+    /// </summary>
+    /// <remarks>
+    /// <b>Frozen wire format.</b> Every identity restored from a seed derives its encryption key
+    /// through this string. Changing it silently changes that key, which breaks decryption of every
+    /// direct message the identity has ever exchanged — with no error at restore time to warn that
+    /// it happened.
+    /// </remarks>
+    private static ReadOnlySpan<byte> X25519DerivationInfo => "tesserchat:x25519-from-ed25519-seed:v1"u8;
 }
