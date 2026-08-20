@@ -72,37 +72,52 @@ implementation.
   Free to run this way — GitHub Actions has no minute limit on standard runners for a public repo.
 - Because the build is `--no-restore` / `--no-build` at each later step, a project missing from
   `TesserChat.slnx` is silently skipped by CI rather than failing loudly. See §3.
-- **The workflow file alone does not block merging.** That's a separate, one-time repo setting:
-  `Settings → Branches → branch protection rule on main → enable "Require status checks to pass
-  before merging" → select the CI job`. This isn't expressible as a committed file — it has to be
-  turned on manually once the repo exists on GitHub, ideally before the first outside contributor
-  shows up.
-- Postgres-backed integration tests (once they exist beyond the unit-level scope in §0.1) will need
-  a `postgres:` service container added to this workflow, or a Testcontainers-based approach.
-  Flagging now so the workflow doesn't quietly need rework later when server integration tests
-  arrive.
+- **The workflow file alone does not block merging** — that is a repo setting, not a committed
+  file. It is **already enabled**: a ruleset named `Main` on `refs/heads/main` requires a pull
+  request and all three `Build & Test (<os>)` checks, with "require branches to be up to date
+  before merging" on, deletion and force-push blocked, and no bypass actors.
+- The repo lives in the **`TesserChat` organisation**, so this lives under
+  `Settings → Rules → Rulesets`, *not* the older `Settings → Branches` page — that page shows only
+  classic branch protection, which this repo does not use and which will look empty.
+- Org-level rulesets can layer on top of the repo one; where both apply, the stricter wins. If
+  protection ever behaves unexpectedly, check the org's rulesets too, not just this repo's.
+- Postgres-backed integration tests need a `postgres:` service container added to this workflow, or
+  a Testcontainers-based approach. This comes due with the first server persistence work (§5.4).
+  Note the 3-OS matrix: confirm the chosen approach works on all three runners, or scope the
+  integration tests to Linux only — and say which, explicitly, rather than letting it be decided by
+  whichever runner fails first.
 
 ### 0.4 What Is Actually Built Today
 
-The repo is **scaffolding only** — the six-project skeleton builds clean (Release, 0 warnings under
-`TreatWarningsAsErrors`), is wired into CI, and has 8 smoke tests passing across the three test
-projects. Nothing in §4–§10 is implemented yet. Concretely, what exists is:
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **92 tests
+passing** across the three test projects. The identity primitives are real; everything that talks to
+a network or a database is not yet built.
 
 | Piece | State |
 |---|---|
 | Solution, six projects, `Directory.Build.props`, `global.json`, `.gitattributes` | done |
-| CI workflow, 3-OS matrix | done (branch protection still needs enabling by hand, §0.3) |
+| CI workflow, 3-OS matrix, branch protection ruleset | done (§0.3) |
 | `GET /health` → `{ "status": "ok" }`, unauthenticated liveness probe | done |
-| `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done |
+| `ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
+| `IdentityKeyPair` — seed → Ed25519 + X25519, sign/verify, ECDH, export/restore (§4.1) | done |
+| `AccountId` — public key → permanent account UUID (§5.1) | done |
+| `PublicIdentity` — public keys, shareable token, fingerprint (§8.1) | done |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
 
-`MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
-proof for the MVVM split, not a design for the real window (§9.2).
+Nothing in §5–§10 exists yet: no Postgres, no EF Core, no SignalR hub, no auth endpoints, no DM
+transport, no Docker image. The server is still a bare minimal host with one endpoint.
 
-`ProtocolVersion` is the one piece of real protocol surface that exists. It is referenced by neither
-client nor server yet; wiring the version exchange into the connect handshake is part of building
-auth (§4.7), and `MinimumSupported` must be bumped in the same PR as any breaking wire-format change.
+`MainWindowViewModel` exposes only `Title` and a placeholder `Greeting` — a wiring proof for the
+MVVM split, not a design for the real window (§9.2).
+
+`ProtocolVersion` is referenced by neither client nor server. Wiring the version exchange into the
+connect handshake is part of building auth (§4.7), and `MinimumSupported` must be bumped in the same
+PR as any breaking wire-format change.
+
+**Work is tracked as GitHub issues**, grouped into milestones M1–M6 roughly following the section
+order of this document, plus `backlog`-labelled stubs for everything in §11's deferred list. Issues
+reference sections of this document by number, which is why §0 asks that they stay stable.
 
 ## 1. What TesserChat Is
 
@@ -122,10 +137,10 @@ nothing depends on it yet. Only the *in* rows are load-bearing for a build right
 |---|---|---|
 | Target framework | **`net10.0`**, set once in `Directory.Build.props` for every project | in |
 | Server | ASP.NET Core (`Microsoft.NET.Sdk.Web`), SignalR for real-time | in / SignalR planned |
-| Server persistence | PostgreSQL | planned |
+| Server persistence | PostgreSQL via **EF Core** + Npgsql (§5.4) | planned |
 | Client | Avalonia UI **12.1.x**, MVVM via **CommunityToolkit.Mvvm** 8.4.x | in |
-| Client local storage | OS-native secure storage (private keys) + SQLite/LiteDB (everything else local) | planned |
-| Crypto | NSec (libsodium binding) — Ed25519 signing, X25519 ECDH, XChaCha20-Poly1305 AEAD | planned |
+| Client local storage | OS-native secure storage (private keys) + **SQLite** (everything else, §9.5) | planned |
+| Crypto | **NSec 26.4.0** (libsodium binding) — Ed25519 signing, X25519 ECDH, XChaCha20-Poly1305 AEAD | in |
 | Voice (future) | SIPSorcery (WebRTC/RTP/ICE/DTLS-SRTP in pure C#) | planned |
 | Client packaging/updates | Velopack — per-OS installers + auto-update, GitHub Releases as source | planned |
 | Server deployment | Docker image, primary distribution path | planned |
@@ -176,12 +191,15 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       app.manifest
       /Views                     #   MainWindow.axaml(.cs)
       /ViewModels                #   ViewModelBase, MainWindowViewModel
-    /TesserChat.Shared           # Wire-protocol DTOs + crypto helpers, no dependencies
+    /TesserChat.Shared           # Wire-protocol DTOs + crypto helpers (NSec)
       ProtocolVersion.cs
-  /tests
-    /TesserChat.Server.Tests     # HealthEndpointTests.cs
-    /TesserChat.Client.Tests     # MainWindowViewModelTests.cs
-    /TesserChat.Shared.Tests     # ProtocolVersionTests.cs
+      /Identity                  #   IdentityKeyPair, AccountId, PublicIdentity
+  /tests                         # each mirrors the /src layout of its counterpart
+    /TesserChat.Server.Tests
+    /TesserChat.Client.Tests
+    /TesserChat.Shared.Tests
+  /docs
+    ARCHITECTURE.md              # this document
   /.github/workflows/ci.yml
   Directory.Build.props          # solution-wide TFM + analyzer settings (§2.1)
   global.json                    # SDK pin
@@ -196,8 +214,8 @@ the .NET 10 SDK default. Every `dotnet` command targets it by name (`dotnet buil
 as CI does. A new project must be added to the `<Folder Name="/src/">` or `<Folder Name="/tests/">`
 element inside it, or it will not build in CI even though it builds locally in an IDE.
 
-There is **no `/docs` directory yet** — create it when there is a document that belongs there rather
-than as an empty placeholder.
+Test files mirror the source layout, so `src/.../Identity/AccountId.cs` is tested by
+`tests/.../Identity/AccountIdTests.cs`. Keep that correspondence when adding files.
 
 ### 3.1 Project Reference Rules
 
