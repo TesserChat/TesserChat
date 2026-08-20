@@ -1,5 +1,7 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk"><!-- Wire-protocol DTOs and crypto helpers shared by client and server. -->
 
-  <!-- Wire-protocol DTOs and crypto helpers shared by client and server. -->
 
+  <ItemGroup>
+    <PackageReference Include="NSec.Cryptography" Version="26.4.0" />
+  </ItemGroup>
 </Project>
