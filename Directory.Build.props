@@ -18,7 +18,7 @@
     <Authors>TesserChat contributors</Authors>
     <Product>TesserChat</Product>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <RepositoryUrl>https://github.com/sebastianpiresmolin/TesserChat</RepositoryUrl>
+    <RepositoryUrl>https://github.com/TesserChat/TesserChat</RepositoryUrl>
   </PropertyGroup>
 
 </Project>
