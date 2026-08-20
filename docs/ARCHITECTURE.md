@@ -346,6 +346,12 @@ user_roles       (user_uuid, role_id)
 ```
 
 ### 5.4 Persistence (PostgreSQL)
+- **ORM: EF Core** with Npgsql. Chosen as the path of least resistance in .NET — migrations are
+  built in, which matters for a self-hosted product where operators upgrade their own servers and
+  a schema change has to apply cleanly to someone else's live database.
+- Integration tests run against a **real Postgres**, not an in-memory provider: the in-memory
+  provider does not enforce constraints or model Postgres behaviour, so it would pass on schemas
+  Postgres rejects. Use Testcontainers or a CI service container (§0.3 flags the workflow change).
 - Room messages: persisted permanently (so members can scroll history from before they joined).
 - File/image attachments: in scope for v1 — store blobs on disk (or S3-compatible object storage
   later) with metadata rows in Postgres; don't put binary blobs directly in Postgres.
@@ -609,8 +615,8 @@ As scaffolded:
 Two separate local stores, split by sensitivity:
 - **Identities** (keypairs) → OS-native secure storage, per §4.2.
 - **Everything else** (known servers, connection history, friends list, DM history, cached session
-  tokens) → local embedded DB (SQLite or LiteDB — pick one; LiteDB avoids a native dependency,
-  SQLite has broader tooling — open decision).
+  tokens) → **SQLite** via `Microsoft.Data.Sqlite`. Chosen for its tooling and inspectability; the
+  native dependency it brings is not a new cost, since NSec already introduced one.
 - Known-servers list should support **export/import as a plain file** — user-initiated, no service
   involved, same philosophy as key file transfer.
 
@@ -678,11 +684,9 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 
 ## 12. Open Decisions (flagged, not blocking)
 
-- SQLite vs. LiteDB for client local storage.
-- Exact audit log scope (which actions get logged).
+- Exact audit log scope (which actions get logged) — §5.5 sets a floor, not a ceiling.
 - Whether room messages ever get an edit/delete history model, or hard-delete only.
-- ORM for Postgres access (EF Core is the path of least resistance in .NET; not yet confirmed).
 
-Settled since the scaffold landed, and no longer open: test framework (**xUnit**), solution format
-(**`.slnx`**), target framework (**`net10.0`**), and the client MVVM library
-(**CommunityToolkit.Mvvm**).
+Settled, and no longer open: test framework (**xUnit**), solution format (**`.slnx`**), target
+framework (**`net10.0`**), client MVVM library (**CommunityToolkit.Mvvm**), server ORM
+(**EF Core**, §5.4), and client local storage (**SQLite**, §9.5).
