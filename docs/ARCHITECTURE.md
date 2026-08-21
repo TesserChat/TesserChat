@@ -77,22 +77,28 @@ implementation.
   before merging" → select the CI job`. This isn't expressible as a committed file — it has to be
   turned on manually once the repo exists on GitHub, ideally before the first outside contributor
   shows up.
-- Postgres-backed integration tests (once they exist beyond the unit-level scope in §0.1) will need
-  a `postgres:` service container added to this workflow, or a Testcontainers-based approach.
-  Flagging now so the workflow doesn't quietly need rework later when server integration tests
-  arrive.
+- Postgres-backed integration tests use **Testcontainers**, not a `services:` block, and run on
+  **`ubuntu-latest` only**. They need a Linux container: the Windows runner's daemon serves Windows
+  containers and the macOS runner has no daemon at all, so neither can run them — and a
+  `services:` block would not have helped, since those attach to Linux runners too. Testcontainers
+  at least means the same code path works on a developer machine with Docker in Linux-container
+  mode.
+- Where Docker can't serve them those tests **skip**; the Test step sets
+  `TESSERCHAT_REQUIRE_DOCKER` on the Linux runner to turn skipping off there. Without that, a
+  broken or missing daemon on the one runner that matters would report green having tested
+  nothing — a silent skip is the failure mode this arrangement has to guard against.
 
 ### 0.4 What Is Actually Built Today
 
-The repo is **scaffolding only** — the six-project skeleton builds clean (Release, 0 warnings under
-`TreatWarningsAsErrors`), is wired into CI, and has 8 smoke tests passing across the three test
-projects. Nothing in §4–§10 is implemented yet. Concretely, what exists is:
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with 97 tests passing
+across the three test projects. Concretely, what exists is:
 
 | Piece | State |
 |---|---|
 | Solution, six projects, `Directory.Build.props`, `global.json`, `.gitattributes` | done |
 | CI workflow, 3-OS matrix | done (branch protection still needs enabling by hand, §0.3) |
 | `GET /health` → `{ "status": "ok" }`, unauthenticated liveness probe | done |
+| EF Core + Npgsql, initial migration, migrate-on-startup, Testcontainers harness (§5.4) | done |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -122,7 +128,7 @@ nothing depends on it yet. Only the *in* rows are load-bearing for a build right
 |---|---|---|
 | Target framework | **`net10.0`**, set once in `Directory.Build.props` for every project | in |
 | Server | ASP.NET Core (`Microsoft.NET.Sdk.Web`), SignalR for real-time | in / SignalR planned |
-| Server persistence | PostgreSQL | planned |
+| Server persistence | PostgreSQL via **EF Core** + Npgsql, snake_case naming (§5.4) | in |
 | Client | Avalonia UI **12.1.x**, MVVM via **CommunityToolkit.Mvvm** 8.4.x | in |
 | Client local storage | OS-native secure storage (private keys) + SQLite/LiteDB (everything else local) | planned |
 | Crypto | NSec (libsodium binding) — Ed25519 signing, X25519 ECDH, XChaCha20-Poly1305 AEAD | planned |
@@ -130,7 +136,7 @@ nothing depends on it yet. Only the *in* rows are load-bearing for a build right
 | Client packaging/updates | Velopack — per-OS installers + auto-update, GitHub Releases as source | planned |
 | Server deployment | Docker image, primary distribution path | planned |
 | Config | `appsettings.json` (gitignored; `appsettings.example.json` is the tracked template) | in |
-| Testing | xUnit 2.9.x + `Microsoft.NET.Test.Sdk`, `coverlet.collector` | in |
+| Testing | xUnit 2.9.x + `Microsoft.NET.Test.Sdk`, `coverlet.collector`, Testcontainers for Postgres | in |
 | License | MIT (`LICENSE` at repo root) | in |
 
 ### 2.1 Solution-Wide Build Settings
@@ -168,6 +174,8 @@ Six projects — three under `/src`, one mirrored test project each under `/test
     /TesserChat.Server           # ASP.NET Core host (Microsoft.NET.Sdk.Web)
       Program.cs                 #   minimal-host entry point; /health endpoint
       appsettings.example.json   #   tracked template — real appsettings.json is gitignored
+      /Persistence               #   EF Core: DbContext, entities, options (§5.4)
+        /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
       /Properties
         launchSettings.json
     /TesserChat.Client           # Avalonia desktop app (WinExe), MVVM
@@ -183,6 +191,7 @@ Six projects — three under `/src`, one mirrored test project each under `/test
     /TesserChat.Client.Tests     # MainWindowViewModelTests.cs
     /TesserChat.Shared.Tests     # ProtocolVersionTests.cs
   /.github/workflows/ci.yml
+  /.config/dotnet-tools.json     # pinned local tools (dotnet-ef) — `dotnet tool restore`
   Directory.Build.props          # solution-wide TFM + analyzer settings (§2.1)
   global.json                    # SDK pin
   .gitattributes                 # line-ending normalization across the 3 CI platforms
@@ -349,9 +358,32 @@ user_roles       (user_uuid, role_id)
 - **ORM: EF Core** with Npgsql. Chosen as the path of least resistance in .NET — migrations are
   built in, which matters for a self-hosted product where operators upgrade their own servers and
   a schema change has to apply cleanly to someone else's live database.
+- **Connection string: `ConnectionStrings:Postgres`**, overridable in a container as the
+  `ConnectionStrings__Postgres` environment variable. The server refuses to start without it and
+  names the key in the error, rather than booting and failing on the first query.
+- **Migrations are applied on startup**, controlled by `Database:MigrateOnStartup` (default
+  `true`). The target operator upgrades by pulling a new Docker image (§5.6), and should not have
+  to exec into a container and run tooling to finish the job; a server quietly serving requests
+  against last version's schema is the worse failure. An operator running a change-controlled
+  database sets this to `false` and applies migrations themselves, and then a server started
+  against an out-of-date schema fails on first use rather than at boot.
+- Migrations live in `src/TesserChat.Server/Persistence/Migrations` and are scaffolded with the
+  version-pinned local tool — `dotnet tool restore` once, then
+  `dotnet ef migrations add <Name> --project src/TesserChat.Server --output-dir Persistence/Migrations`.
+  An `IDesignTimeDbContextFactory` keeps the tooling from booting the real host to find the
+  context, so scaffolding never reaches for a developer's `appsettings.json` or the database it
+  names.
+- **Tables and columns are snake_case**, applied by convention (`EFCore.NamingConventions`) rather
+  than per-property attributes. Postgres folds unquoted identifiers to lowercase, so EF's default
+  PascalCase would have to be double-quoted in every query an operator ever hand-writes against
+  their own database. Changing this later is a rename migration across every table, so it is
+  settled here.
+- The schema today is one table, `server_instances`, holding this deployment's own id — enough to
+  have something real to migrate and round-trip. The first-run setup flow (§5.6) extends it.
 - Integration tests run against a **real Postgres**, not an in-memory provider: the in-memory
   provider does not enforce constraints or model Postgres behaviour, so it would pass on schemas
-  Postgres rejects. Use Testcontainers or a CI service container (§0.3 flags the workflow change).
+  Postgres rejects. Testcontainers, Linux-only in CI — see §0.3 for why, and for the guard against
+  those tests silently skipping.
 - Room messages: persisted permanently (so members can scroll history from before they joined).
 - File/image attachments: in scope for v1 — store blobs on disk (or S3-compatible object storage
   later) with metadata rows in Postgres; don't put binary blobs directly in Postgres.
@@ -370,8 +402,8 @@ default to logging role changes, kicks/bans, and message deletions at minimum.
 - Config lives in `appsettings.json`, standard ASP.NET Core configuration layering (env var
   overrides for container deployments). That file is gitignored; `appsettings.example.json` is the
   tracked template and must be updated whenever a new key is introduced (§3.2).
-- Not built yet. Today `Program.cs` is a bare minimal host with a single `/health` endpoint (§0.4) —
-  no Docker image, no setup mode, no Postgres.
+- Not built yet: there is no Docker image and no setup mode. The database underneath it exists
+  (§5.4), including the `server_instances` row this flow will populate, but nothing writes to it.
 
 ## 6. Real-Time Transport
 
