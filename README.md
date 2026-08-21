@@ -6,8 +6,9 @@ Anyone can run a server on their own hardware. There is no central service, no c
 system, and no central directory — your identity is a public/private keypair you control, portable
 across every server you join.
 
-> **Status: early development.** The repository currently contains the project scaffolding and the
-> core identity primitives. It is not yet usable as a chat platform.
+> **Status: early development.** The repository currently contains the project scaffolding, the
+> core identity primitives, and the server's database layer. It is not yet usable as a chat
+> platform.
 
 ## Design
 
@@ -40,6 +41,26 @@ dotnet test TesserChat.slnx
 ```
 
 Builds and tests run on Linux, Windows, and macOS in CI on every pull request.
+
+The server's Postgres integration tests need Docker running in Linux-container mode. Without it
+they skip rather than fail, so a run that reports skipped tests is expected on a machine without
+Docker — not a broken checkout.
+
+## Configuring a server
+
+`src/TesserChat.Server/appsettings.example.json` is the tracked template listing every key the
+server reads. Real `appsettings.json` files are gitignored, since they hold per-deployment secrets:
+
+```sh
+cp src/TesserChat.Server/appsettings.example.json src/TesserChat.Server/appsettings.json
+```
+
+Then set `ConnectionStrings:Postgres` to your own database. The server will not start without it.
+In a container, override it as the `ConnectionStrings__Postgres` environment variable instead.
+
+Pending migrations are applied when the server starts, so a fresh database needs no manual schema
+setup. Set `Database:MigrateOnStartup` to `false` if you would rather apply them yourself. See
+[§5.4](docs/ARCHITECTURE.md#54-persistence-postgresql) for both.
 
 ## Contributing
 

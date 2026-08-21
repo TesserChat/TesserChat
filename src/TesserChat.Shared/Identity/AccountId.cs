@@ -25,7 +25,7 @@ namespace TesserChat.Shared.Identity;
 /// the hash would silently orphan every existing account, so treat this as frozen wire format.
 /// </para>
 /// </remarks>
-public static class AccountId
+public static class   AccountId
 {
     /// <summary>
     /// Domain separator, mixed in so this hash can never collide with some other use of SHA-256

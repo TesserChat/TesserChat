@@ -1,6 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
+    <PackageReference Include="EFCore.NamingConventions" Version="10.0.1" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+    <!--
+      Referenced explicitly only to unify the graph on one EF Core patch. Npgsql 10.0.3 asks for
+      10.0.4 while the design-time package below is on 10.0.11, and without these the test project
+      resolves the two halves at different versions (MSB3277). Any 10.0.x satisfies Npgsql, so
+      unify upward rather than holding the whole solution back to 10.0.4.
+    -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="10.0.11" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" />
+    <!-- Design-time only: needed by `dotnet ef`, never shipped in the server's output. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\TesserChat.Shared\TesserChat.Shared.csproj" />
   </ItemGroup>
 

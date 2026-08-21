@@ -1,6 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
-using Microsoft.AspNetCore.Mvc.Testing;
+using TesserChat.Server.Tests.Infrastructure;
 
 namespace TesserChat.Server.Tests;
 
@@ -8,11 +8,17 @@ namespace TesserChat.Server.Tests;
 /// Boots the real server host in-memory. Doubles as the check that the whole
 /// Server → Shared reference chain actually starts up, not just compiles.
 /// </summary>
-public class HealthEndpointTests : IClassFixture<WebApplicationFactory<Program>>
+/// <remarks>
+/// Uses a host with no database (§5.4): the probe is meant to answer whether the process is alive,
+/// so it must not need Postgres to do it — that is what keeps it usable as a container liveness
+/// check while the database is still starting.
+/// </remarks>
+[Collection(ServerHostCollection.Name)]
+public sealed class HealthEndpointTests : IDisposable
 {
-    private readonly WebApplicationFactory<Program> _factory;
+    private readonly TesserChatServerFactory _factory = TesserChatServerFactory.WithoutDatabase();
 
-    public HealthEndpointTests(WebApplicationFactory<Program> factory) => _factory = factory;
+    public void Dispose() => _factory.Dispose();
 
     [Fact]
     public async Task Health_ReturnsOk()
