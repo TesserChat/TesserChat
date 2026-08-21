@@ -32,3 +32,9 @@ jobs:
 
       - name: Test
         run: dotnet test TesserChat.slnx --configuration Release --no-build --verbosity normal
+        env:
+          # The Postgres integration tests need a Linux container, which only the Linux runner can
+          # serve — the Windows runner's daemon is in Windows-container mode and the macOS runner
+          # has none. They skip elsewhere; here a missing daemon must fail the job rather than
+          # quietly skip, or this runner could go green having tested nothing. See §0.3.
+          TESSERCHAT_REQUIRE_DOCKER: ${{ matrix.os == 'ubuntu-latest' }}
