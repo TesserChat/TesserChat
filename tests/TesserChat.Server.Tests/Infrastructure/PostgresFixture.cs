@@ -21,6 +21,18 @@ public sealed class PostgresFixture : IAsyncLifetime
     /// </summary>
     private const string PostgresImage = "postgres:18-alpine";
 
+    /// <summary>
+    /// Connections each booted host may hold open.
+    /// </summary>
+    /// <remarks>
+    /// Postgres allows 100 connections by default and Npgsql's own default pool is 100, so a single
+    /// host could exhaust the server on its own. Tests boot a host per case and several boot two at
+    /// once, which is how CI hit "sorry, too many clients already" on a run that passed locally —
+    /// the ceiling is reached by however many hosts happen to overlap, so the test that reports it
+    /// is arbitrary.
+    /// </remarks>
+    private const int MaxPoolSizePerHost = 5;
+
     private PostgreSqlContainer? _container;
 
     /// <remarks>
@@ -37,7 +49,14 @@ public sealed class PostgresFixture : IAsyncLifetime
             return;
         }
 
-        _container = new PostgreSqlBuilder(PostgresImage).Build();
+        _container = new PostgreSqlBuilder(PostgresImage)
+            // Above the 100 Postgres allows by default. Each booted host holds a bounded pool
+            // (MaxPoolSizePerHost), but pools are keyed by connection string and linger briefly
+            // after a host is disposed, so overlapping hosts can still stack up on a slow runner.
+            // Headroom here is free; a flaky "too many clients" failure is not.
+            .WithCommand("-c", "max_connections=300")
+            .Build();
+
         await _container.StartAsync();
     }
 
@@ -81,6 +100,7 @@ public sealed class PostgresFixture : IAsyncLifetime
         return new NpgsqlConnectionStringBuilder(_container.GetConnectionString())
         {
             Database = databaseName,
+            MaxPoolSize = MaxPoolSizePerHost,
         }.ConnectionString;
     }
 }

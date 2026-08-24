@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
 using TesserChat.Server.Setup;
@@ -101,6 +102,12 @@ internal sealed class SetupHost : IAsyncDisposable
     {
         _client.Dispose();
         _factory.Dispose();
+
+        // Npgsql pools are keyed by connection string and outlive the factory that created them,
+        // so disposing the host alone leaves its connections open against a container every other
+        // test shares. Each test has a database of its own, so no other host wants these pools.
+        NpgsqlConnection.ClearAllPools();
+
         return ValueTask.CompletedTask;
     }
 }
