@@ -90,7 +90,7 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **170 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **186 tests
 passing** across the three test projects. The identity, persistence, authorization, and admission
 layers are real; nothing is reachable over a network yet.
 
@@ -104,6 +104,7 @@ layers are real; nothing is reachable over a network yet.
 | Account registration and public key storage (§5.1) | done |
 | Dynamic roles, permissions, and resolution (§5.3) | done |
 | Connection modes: open, password-gated, allowlist (§5.2) | done |
+| First-run setup and Owner assignment (§5.6) | done |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -188,6 +189,7 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       /Persistence               #   EF Core: DbContext, entities, options (§5.4)
         /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
       /Accounts                  #   registration, public key storage, admission (§5.1, §5.2)
+      /Setup                     #   first-run setup and Owner assignment (§5.6)
       /Authorization             #   roles, permission catalogue, resolution (§5.3)
       /Properties
         launchSettings.json
@@ -558,8 +560,47 @@ default to logging role changes, kicks/bans, and message deletions at minimum.
 - Config lives in `appsettings.json`, standard ASP.NET Core configuration layering (env var
   overrides for container deployments). That file is gitignored; `appsettings.example.json` is the
   tracked template and must be updated whenever a new key is introduced (§3.2).
-- Not built yet: there is no Docker image and no setup mode. The database underneath it exists
-  (§5.4), including the `server_instances` row this flow will populate, but nothing writes to it.
+- The Docker image is not built yet (#28). Setup itself is (`src/TesserChat.Server/Setup/`).
+
+#### 5.6.1 Setup is unauthenticated, so it runs exactly once
+
+There is no Owner to authorize setup — the account that will hold Owner does not exist until setup
+creates it. Three properties make that safe, and each is enforced rather than assumed:
+
+- **It runs once.** "Setup is complete" is defined as the `server_instances` row existing, which the
+  completing transaction writes. An already-configured server refuses outright, so setup can never
+  become an unauthenticated route to Owner on a live server. This holds across restarts, and binds
+  the original Owner too — setup is a one-time event, not an administrative action.
+- **It is atomic.** The Owner's account, the Owner role grant, and the server row are written in one
+  transaction. A crash partway leaves the server unconfigured and retryable rather than half-owned.
+- **At most one server row can exist**, held by a unique index on a constant column rather than by
+  whichever request checked first. Concurrent claimants therefore resolve to one Owner: one wins,
+  the rest are told the server is already configured.
+
+#### 5.6.2 Pinning who may claim ownership
+
+`Setup:OwnerPublicKey` pins the public key permitted to complete setup. With it set, **setup stops
+being a race and becomes a claim exactly one key can make** — so a fresh server can be published to
+a public address safely. It takes a bare Ed25519 key or a full shareable identity token, whichever
+the operator has to hand, and is compared in constant time.
+
+**Left unset, the first client to complete setup becomes Owner.** That is the right default for
+bringing a server up on a machine nothing else can reach, and the wrong one for a container
+published straight to the internet, where whoever scans the port first takes the server. Because the
+unsafe case is invisible until it has already happened, an unconfigured server with no key pinned
+**logs a warning on every boot** naming the setting to set.
+
+A key that is set but unreadable refuses everyone: an operator who pinned a key meant to restrict
+setup, and a value that will not parse is not evidence they changed their mind.
+
+#### 5.6.3 What the server row records
+
+`server_instances` holds the deployment's stable id (which the login nonce scoping in §4.7 binds
+signatures to), its name, when setup completed, and the account that completed it.
+
+`set_up_by_account_id` is for the audit trail (§5.5) — it records who set the server up, which stays
+true even after they hand the Owner role on. **It is not how ownership is resolved**; that is the
+Owner role (§5.3), which can be granted to others or moved.
 
 ## 6. Real-Time Transport
 

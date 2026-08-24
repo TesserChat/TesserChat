@@ -26,6 +26,8 @@ internal sealed class TesserChatServerFactory : WebApplicationFactory<Program>
     private const string ConnectionModeKey = "Connection__Mode";
     private const string JoinSecretHashKey = "Connection__JoinSecretHash";
     private const string AllowlistKeyPrefix = "Connection__Allowlist__";
+    private const string SetupOwnerKey = "Setup__OwnerPublicKey";
+    private const string SetupServerNameKey = "Setup__ServerName";
 
     private readonly List<(string Name, string? PreviousValue)> _overrides = [];
 
@@ -88,6 +90,24 @@ internal sealed class TesserChatServerFactory : WebApplicationFactory<Program>
     /// </remarks>
     public static TesserChatServerFactory WithoutConnectionString()
         => new(" ", migrateOnStartup: false);
+
+    /// <summary>
+    /// Sets first-run setup configuration (§5.6).
+    /// </summary>
+    public TesserChatServerFactory WithSetup(string? ownerPublicKey = null, string? serverName = null)
+    {
+        if (ownerPublicKey is not null)
+        {
+            Override(SetupOwnerKey, ownerPublicKey);
+        }
+
+        if (serverName is not null)
+        {
+            Override(SetupServerNameKey, serverName);
+        }
+
+        return this;
+    }
 
     private void Override(string name, string value)
     {

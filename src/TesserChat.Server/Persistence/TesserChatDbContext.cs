@@ -42,6 +42,31 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             entity.Property(instance => instance.Id).ValueGeneratedNever();
 
             entity.Property(instance => instance.CreatedAt).IsRequired();
+
+            entity.Property(instance => instance.Name)
+                .IsRequired()
+                .HasMaxLength(ServerInstance.NameMaxLength);
+
+            entity.Property(instance => instance.SetUpAt).IsRequired();
+            entity.Property(instance => instance.SetUpByAccountId).IsRequired();
+
+            // At most one row, ever. Setup completing is defined as this row existing (§5.6), so
+            // "setup runs once" has to be a property of the database rather than of the code that
+            // happens to check first — otherwise two clients racing on a fresh server could both
+            // pass their check and both claim Owner.
+            //
+            // A one-column table with a constant default and a unique index on it: the second
+            // insert collides on the index whatever id it carries. Expressed on a shadow property
+            // so nothing in the model has to carry a column that means nothing to it, and given a
+            // default in the store so EF never sends a value for it.
+            entity.Property<bool>("singleton")
+                .HasColumnName("singleton")
+                .HasDefaultValueSql("true")
+                .ValueGeneratedOnAdd();
+
+            entity.HasIndex("singleton")
+                .IsUnique()
+                .HasDatabaseName("ix_server_instances_singleton");
         });
 
         modelBuilder.Entity<Account>(entity =>
