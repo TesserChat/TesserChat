@@ -19,6 +19,20 @@ internal static class AccountExtensions
         // Scoped, matching the DbContext it holds — a singleton would outlive its context.
         builder.Services.AddScoped<AccountRegistrar>();
 
+        builder.Services
+            .AddOptions<ConnectionOptions>()
+            .Bind(builder.Configuration.GetSection(ConnectionOptions.SectionName));
+
+        // One policy per admission path (§5.2). Registered as a set rather than selected here, so
+        // AdmissionGate can pick per request and a mode change needs no restart — and so an invite
+        // policy (#44) is an added registration rather than an edited switch.
+        builder.Services.AddSingleton<IAdmissionPolicy, OpenAdmissionPolicy>();
+        builder.Services.AddSingleton<IAdmissionPolicy, PasswordGatedAdmissionPolicy>();
+        builder.Services.AddSingleton<IAdmissionPolicy, AllowlistAdmissionPolicy>();
+
+        // Singleton: it holds only the policy set and an options monitor, no per-request state.
+        builder.Services.AddSingleton<AdmissionGate>();
+
         return builder;
     }
 }

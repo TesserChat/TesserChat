@@ -24,9 +24,9 @@ internal enum AccountRegistrationStatus
     /// The server's connection mode does not admit this key (§5.2).
     /// </summary>
     /// <remarks>
-    /// Nothing produces this yet — connection modes are #9. It exists so the gate has a status to
-    /// return when it lands, rather than that change having to widen this enum and every switch
-    /// over it.
+    /// Carries no detail about <i>why</i>, deliberately — see <see cref="AdmissionDecision"/>. A
+    /// caller cannot tell a wrong joining password from an unlisted key, which is what stops an
+    /// unauthenticated stranger from learning a server's mode or probing its allowlist.
     /// </remarks>
     NotPermitted,
 }

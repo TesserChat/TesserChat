@@ -90,9 +90,9 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **148 tests
-passing** across the three test projects. The identity, persistence, and authorization layers are
-real; nothing is reachable over a network yet.
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **170 tests
+passing** across the three test projects. The identity, persistence, authorization, and admission
+layers are real; nothing is reachable over a network yet.
 
 | Piece | State |
 |---|---|
@@ -103,6 +103,7 @@ real; nothing is reachable over a network yet.
 | `IdentityKeyPair`, `AccountId`, `PublicIdentity` (§4.1, §5.1) | done |
 | Account registration and public key storage (§5.1) | done |
 | Dynamic roles, permissions, and resolution (§5.3) | done |
+| Connection modes: open, password-gated, allowlist (§5.2) | done |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -186,7 +187,7 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       appsettings.example.json   #   tracked template — real appsettings.json is gitignored
       /Persistence               #   EF Core: DbContext, entities, options (§5.4)
         /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
-      /Accounts                  #   registration and public key storage (§5.1)
+      /Accounts                  #   registration, public key storage, admission (§5.1, §5.2)
       /Authorization             #   roles, permission catalogue, resolution (§5.3)
       /Properties
         launchSettings.json
@@ -340,12 +341,90 @@ server-side — a malicious server must not be able to force a remote wipe.
   internally (permissions, audit trail, message authorship).
 - Server stores the mapping UUID → public key → display name.
 
+As built (`src/TesserChat.Server/Accounts/`, `Persistence/Account.cs`):
+
+```
+accounts (id, signing_key UNIQUE, encryption_key, display_name, registered_at)
+```
+
+**The id is derived, not generated** — `AccountId.FromPublicKey` over the Ed25519 key (§4.1), so
+registration is idempotent by construction: the same key presented twice resolves to the same
+account, and survives a database restore unchanged. The unique index on `signing_key` states the
+same rule independently of the id scheme.
+
+**Both public keys are stored on one row.** The signing key is what logins verify against; the
+X25519 key is published so a DM partner can discover an encryption key without a directory service
+(§7.1). Pairing them at the storage layer removes any way to match the two wrongly later.
+
+**Display names are not unique and are never identifiers.** Two members may pick the same name;
+they stay distinct accounts. Re-registering an existing key is *not* a rename — a returning member
+keeps the name they last set.
+
+Concurrent registrations of one key resolve to a single account: the attempt that loses the insert
+race re-reads and reports the winner's row.
+
 ### 5.2 Server Connection Modes
-Configurable per server instance, at setup time (changeable later by the Owner):
-1. **Open** — anyone can connect and self-register a public key.
+Configurable per server instance, at setup time (changeable later by an account holding
+`server.manage`, §5.3):
+1. **Open** — anyone can connect and self-register a public key. The default.
 2. **Password-gated initial connect** — a shared password required only for the first
    registration; subsequent logins use the normal challenge-response.
 3. **Allowlist-only** — only pre-approved public keys can register at all.
+
+Configured under `Connection` in `appsettings.json`, or as `Connection__Mode` etc. in a container
+(§3.2). Read through `IOptionsMonitor`, so a mode change takes effect on the next registration
+rather than at the next restart.
+
+#### 5.2.1 The gate applies to joining, never to logging in
+
+A joining credential is **first-contact only**. The gate is consulted only for a key the server has
+not seen; a key it already knows is returning, not joining, and authenticates by challenge-response
+(§4.7) instead.
+
+This ordering is load-bearing. Re-gating a known key would lock out every existing member the
+moment an operator rotated the password or trimmed the allowlist — turning routine maintenance into
+an outage. It also means removing a key from the allowlist does **not** remove an account that
+already registered; that is kicking or banning (§5.5).
+
+#### 5.2.2 Admission is a set of policies, not a switch
+
+Each mode is an `IAdmissionPolicy` selected per registration, rather than a `switch` at the call
+site. That is deliberate: **single-use invite links (#44) are a fourth admission path, not a fourth
+mode** — an invite admits a key the configured mode would otherwise refuse. Building the gate as a
+policy set means invites arrive as an added implementation rather than a rewrite of the gate and
+every caller.
+
+`AdmissionRequest` carries the credentials a caller presents, with a field for an invite token
+already in the shape. Nothing reads it yet.
+
+#### 5.2.3 Refusals are uniform, and misconfiguration fails closed
+
+**A refusal carries no reason.** A caller cannot tell a wrong password from an unlisted key, because
+every distinguishable reason tells an unauthenticated stranger something about a server they have
+not joined: which mode it runs, or — by probing keys — what is on its allowlist. That is the same
+boundary §7.4.1 and §8.2 draw elsewhere. The operator knows their own mode and tells invitees out of
+band; nobody who needs the distinction has to learn it from a rejection.
+
+**Misconfiguration refuses everyone rather than admitting them.** A password-gated server with no
+password hash configured, an empty allowlist, and a mode with no registered policy all admit nobody.
+The opposite default silently turns a restricted server open, which hands it to whoever notices
+first.
+
+#### 5.2.4 The joining password is stored hashed
+
+`Connection:JoinSecretHash` holds a salted PBKDF2-SHA256 hash, never the password. An operator
+reading their own database — or a leaked backup — does not thereby learn a secret they can hand to
+someone else, or one a member may have reused elsewhere. `dotnet run -- hash-join-secret "<password>"`
+produces the value.
+
+**PBKDF2 here, Argon2id for key backup (§4.5)** — different problems. A backup file is stolen
+outright and attacked offline forever, so memory-hardness is what protects an identity. A joining
+password is server-side, gates one action, and can be rotated the moment it leaks. Revisiting this
+if Argon2 arrives for §4.5 is cheap: only the stored format changes, and only for servers using this
+mode.
+
+Since one password is shared by everyone, it cannot be revoked for one person and it leaks the first
+time someone forwards it — which is the gap invites (#44) exist to close.
 
 ### 5.3 Roles & Permissions
 Built as a **dynamic system from day one** — roles are not an enum. Roles map to a permission set
@@ -788,6 +867,7 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 - Voice backend (SIPSorcery wiring)
 - Group E2E encryption (MLS) — out of scope entirely per current design; only 1:1 DMs are encrypted
 - Server-side block-list enforcement for the offline mailbox queue
+- Single-use invite links for password-gated and allowlist servers (§5.2.2)
 - Light theme / full custom theming UI
 - Mobile clients (Avalonia supports the targets; no current plan to build them)
 

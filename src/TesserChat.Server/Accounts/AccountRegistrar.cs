@@ -16,12 +16,19 @@ namespace TesserChat.Server.Accounts;
 /// </para>
 /// <para>
 /// <b>This does not authenticate anyone.</b> It records that a public key is known to this server;
-/// proving possession of the matching private key is the challenge-response flow in §4.7. Nor does
-/// it decide <i>whether</i> a key may register — that is the server's connection mode (§5.2, #9),
-/// which slots in at the marked point below.
+/// proving possession of the matching private key is the challenge-response flow in §4.7.
+/// </para>
+/// <para>
+/// Whether a key may register at all is the server's connection mode, asked through
+/// <see cref="AdmissionGate"/> (§5.2). The gate is consulted only for a key this server has not
+/// seen: joining credentials are first-contact only, so a returning member is never asked for one
+/// again.
 /// </para>
 /// </remarks>
-internal sealed class AccountRegistrar(TesserChatDbContext context, TimeProvider timeProvider)
+internal sealed class AccountRegistrar(
+    TesserChatDbContext context,
+    AdmissionGate admissionGate,
+    TimeProvider timeProvider)
 {
     /// <summary>
     /// Registers <paramref name="identity"/> on this server, or returns the existing account for it.
@@ -32,9 +39,14 @@ internal sealed class AccountRegistrar(TesserChatDbContext context, TimeProvider
     /// registered — a returning member keeps the name they last set, and re-registering is not a
     /// rename.
     /// </param>
+    /// <param name="credentials">
+    /// What the caller presents to be admitted — a joining password, or later an invite (#44). Omit
+    /// for an Open server, which reads neither.
+    /// </param>
     public async Task<AccountRegistrationResult> RegisterAsync(
         PublicIdentity identity,
         string displayName,
+        AdmissionCredentials? credentials = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(identity);
@@ -44,14 +56,23 @@ internal sealed class AccountRegistrar(TesserChatDbContext context, TimeProvider
             return AccountRegistrationResult.Rejected(AccountRegistrationStatus.InvalidDisplayName);
         }
 
-        // The connection-mode check (§5.2) belongs here, before anything is written: open,
-        // password-gated, or allowlist-only decides whether this key may register at all. Until #9
-        // lands every key is admitted, which is the "open" mode's behaviour.
-
+        // Before the gate, deliberately. A key this server already knows is returning, not joining,
+        // and §5.2 makes the joining credential first-contact only — re-gating it would lock out
+        // every existing member the moment an operator rotated the password or trimmed the
+        // allowlist.
         var existing = await FindAsync(identity.AccountId, cancellationToken);
         if (existing is not null)
         {
             return AccountRegistrationResult.AlreadyRegistered(existing);
+        }
+
+        var admission = await admissionGate.EvaluateAsync(
+            new AdmissionRequest(identity, credentials?.JoinSecret, credentials?.InviteToken),
+            cancellationToken);
+
+        if (admission != AdmissionDecision.Admitted)
+        {
+            return AccountRegistrationResult.Rejected(AccountRegistrationStatus.NotPermitted);
         }
 
         var account = new Account
