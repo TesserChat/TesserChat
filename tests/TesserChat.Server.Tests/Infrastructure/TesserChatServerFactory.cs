@@ -23,6 +23,9 @@ internal sealed class TesserChatServerFactory : WebApplicationFactory<Program>
 {
     private const string ConnectionStringKey = "ConnectionStrings__Postgres";
     private const string MigrateOnStartupKey = "Database__MigrateOnStartup";
+    private const string ConnectionModeKey = "Connection__Mode";
+    private const string JoinSecretHashKey = "Connection__JoinSecretHash";
+    private const string AllowlistKeyPrefix = "Connection__Allowlist__";
 
     private readonly List<(string Name, string? PreviousValue)> _overrides = [];
 
@@ -37,6 +40,35 @@ internal sealed class TesserChatServerFactory : WebApplicationFactory<Program>
     /// </summary>
     public static TesserChatServerFactory ForDatabase(string connectionString, bool migrateOnStartup = true)
         => new(connectionString, migrateOnStartup);
+
+    /// <summary>
+    /// Sets the server's connection mode and its credentials (§5.2).
+    /// </summary>
+    /// <remarks>
+    /// Fluent so a test reads as one expression. Applied as environment variables like every other
+    /// override here, and reverted on dispose.
+    /// </remarks>
+    public TesserChatServerFactory WithConnectionMode(
+        string mode,
+        string? joinSecretHash = null,
+        params string[] allowlist)
+    {
+        Override(ConnectionModeKey, mode);
+
+        if (joinSecretHash is not null)
+        {
+            Override(JoinSecretHashKey, joinSecretHash);
+        }
+
+        // Configuration binds a list from indexed keys, which is what a container operator would
+        // set as Connection__Allowlist__0 as well.
+        for (var i = 0; i < allowlist.Length; i++)
+        {
+            Override($"{AllowlistKeyPrefix}{i}", allowlist[i]);
+        }
+
+        return this;
+    }
 
     /// <summary>
     /// A host for tests that never touch the database: migrations are off and the connection

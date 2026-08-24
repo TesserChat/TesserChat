@@ -36,12 +36,27 @@ internal sealed class RegistrarHost : IAsyncDisposable
     /// <summary>
     /// Creates an empty database on the shared container and boots a host against it.
     /// </summary>
-    public static async Task<RegistrarHost> StartAsync(PostgresFixture postgres)
+    /// <param name="postgres">The shared container fixture.</param>
+    /// <param name="mode">
+    /// Connection mode to configure (§5.2). Omit for the server's default, which is Open.
+    /// </param>
+    /// <param name="joinSecretHash">Hashed joining password, for a password-gated server.</param>
+    /// <param name="allowlist">Permitted public keys, for an allowlist-only server.</param>
+    public static async Task<RegistrarHost> StartAsync(
+        PostgresFixture postgres,
+        string? mode = null,
+        string? joinSecretHash = null,
+        params string[] allowlist)
     {
         ArgumentNullException.ThrowIfNull(postgres);
 
         var connectionString = await postgres.CreateDatabaseAsync();
         var factory = TesserChatServerFactory.ForDatabase(connectionString);
+
+        if (mode is not null)
+        {
+            factory = factory.WithConnectionMode(mode, joinSecretHash, allowlist);
+        }
 
         // Boots the host, which is what applies the migrations these tests need.
         var client = factory.CreateClient();
