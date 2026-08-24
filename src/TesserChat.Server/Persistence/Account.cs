@@ -61,6 +61,16 @@ internal sealed class Account
     public DateTimeOffset RegisteredAt { get; init; }
 
     /// <summary>
+    /// The roles this account holds (§5.3).
+    /// </summary>
+    /// <remarks>
+    /// May be empty: holding no roles is valid and resolves to no permissions. Effective
+    /// permissions are the union of what these roles grant, computed by <c>PermissionResolver</c>
+    /// rather than read from here.
+    /// </remarks>
+    public ICollection<AccountRole> Roles { get; } = [];
+
+    /// <summary>
     /// Rebuilds the public identity this account was registered from.
     /// </summary>
     /// <remarks>
