@@ -1,8 +1,10 @@
+using TesserChat.Server.Accounts;
 using TesserChat.Server.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddPersistence();
+builder.AddAccounts();
 
 var app = builder.Build();
 

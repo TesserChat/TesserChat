@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using TesserChat.Shared.Identity;
 
 namespace TesserChat.Server.Persistence;
 
@@ -17,6 +18,8 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
 {
     public DbSet<ServerInstance> ServerInstances => Set<ServerInstance>();
 
+    public DbSet<Account> Accounts => Set<Account>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -30,6 +33,36 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             entity.Property(instance => instance.Id).ValueGeneratedNever();
 
             entity.Property(instance => instance.CreatedAt).IsRequired();
+        });
+
+        modelBuilder.Entity<Account>(entity =>
+        {
+            entity.HasKey(account => account.Id);
+
+            // Derived from the signing key (§5.1), so the database must never invent one.
+            entity.Property(account => account.Id).ValueGeneratedNever();
+
+            entity.Property(account => account.SigningKey)
+                .IsRequired()
+                .HasMaxLength(IdentityKeyPair.PublicKeySize)
+                .IsFixedLength();
+
+            entity.Property(account => account.EncryptionKey)
+                .IsRequired()
+                .HasMaxLength(IdentityKeyPair.PublicKeySize)
+                .IsFixedLength();
+
+            entity.Property(account => account.DisplayName)
+                .IsRequired()
+                .HasMaxLength(Account.DisplayNameMaxLength);
+
+            entity.Property(account => account.RegisteredAt).IsRequired();
+
+            // The id is a truncated hash of this key (§5.1), so the primary key already collides
+            // for a repeat registration. This states the real rule directly rather than leaving it
+            // implied by the hash: one account per signing key, enforced by Postgres even if a
+            // future id scheme changes.
+            entity.HasIndex(account => account.SigningKey).IsUnique();
         });
     }
 }
