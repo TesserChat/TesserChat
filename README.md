@@ -1,14 +1,21 @@
-# TesserChat
+<p align="center">
+  <img src="TesserChat_logo.png" alt="TesserChat" width="180">
+</p>
 
-Open source, self-hosted chat and communication service.
+<h1 align="center">TesserChat</h1>
+
+<p align="center">
+  Open source, self-hosted chat and communication service.
+</p>
 
 Anyone can run a server on their own hardware. There is no central service, no central account
 system, and no central directory — your identity is a public/private keypair you control, portable
 across every server you join.
 
-> **Status: early development.** The repository currently contains the project scaffolding, the
-> core identity primitives, and the server's database layer. It is not yet usable as a chat
-> platform.
+> **Status: early development.** The repository contains the project scaffolding, the core identity
+> primitives, and the server's persistence, account, authorization, and admission layers. Nothing is
+> reachable over a network yet — there is no authentication and no chat transport, so it is not yet
+> usable as a chat platform.
 
 ## Design
 
