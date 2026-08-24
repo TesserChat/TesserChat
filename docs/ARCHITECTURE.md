@@ -90,18 +90,28 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with 97 tests passing
-across the three test projects. Concretely, what exists is:
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **148 tests
+passing** across the three test projects. The identity, persistence, and authorization layers are
+real; nothing is reachable over a network yet.
 
 | Piece | State |
 |---|---|
 | Solution, six projects, `Directory.Build.props`, `global.json`, `.gitattributes` | done |
-| CI workflow, 3-OS matrix | done (branch protection still needs enabling by hand, §0.3) |
+| CI workflow, 3-OS matrix, branch protection ruleset | done (§0.3) |
 | `GET /health` → `{ "status": "ok" }`, unauthenticated liveness probe | done |
-| EF Core + Npgsql, initial migration, migrate-on-startup, Testcontainers harness (§5.4) | done |
-| `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done |
+| EF Core + Npgsql, migrations, migrate-on-startup, Testcontainers harness (§5.4) | done |
+| `IdentityKeyPair`, `AccountId`, `PublicIdentity` (§4.1, §5.1) | done |
+| Account registration and public key storage (§5.1) | done |
+| Dynamic roles, permissions, and resolution (§5.3) | done |
+| `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
+
+**Nothing built so far is reachable from outside the process.** There are no HTTP or SignalR
+endpoints beyond `/health`, no auth, and therefore no way for a client to register, log in, or
+manage roles. `AccountRegistrar`, `PermissionResolver`, and `RoleManager` are internal classes
+exercised by tests. Exposing them is auth's job (§4.7) and the transport work in §6 — and note that
+neither "role management endpoints" nor "role management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
 proof for the MVVM split, not a design for the real window (§9.2).
@@ -176,6 +186,8 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       appsettings.example.json   #   tracked template — real appsettings.json is gitignored
       /Persistence               #   EF Core: DbContext, entities, options (§5.4)
         /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
+      /Accounts                  #   registration and public key storage (§5.1)
+      /Authorization             #   roles, permission catalogue, resolution (§5.3)
       /Properties
         launchSettings.json
     /TesserChat.Client           # Avalonia desktop app (WinExe), MVVM
@@ -336,23 +348,88 @@ Configurable per server instance, at setup time (changeable later by the Owner):
 3. **Allowlist-only** — only pre-approved public keys can register at all.
 
 ### 5.3 Roles & Permissions
-Built as a **dynamic system from day one** — do not hardcode three roles as an enum. Model as
-roles + a permission set, many-to-many, so custom roles/permissions can be added later without a
-schema migration.
+Built as a **dynamic system from day one** — roles are not an enum. Roles map to a permission set
+many-to-many, so an administrator can create roles and choose what each grants at runtime, with no
+restart and no schema migration.
 - Ship with 3 default roles: **Owner, Admin, Member.**
 - **Owner** is assigned automatically to whoever completes the first-run setup wizard (see §5.6)
-  and should be treated as non-deletable/non-demotable via normal role-management UI (a server
-  needs at least one Owner at all times).
+  and is non-deletable/non-demotable (a server needs at least one Owner at all times).
 - Roles and permissions are **per-server** — there is no global role system, consistent with there
   being no global account system.
 
-Rough shape (illustrative, not final DDL):
+As built (`src/TesserChat.Server/Authorization/`, `Persistence/Role.cs`, `PermissionGrant.cs`):
+
 ```
-roles            (id, server_id, name, is_system_role)
-permissions      (id, key, description)          -- e.g. "messages.delete", "members.kick"
-role_permissions (role_id, permission_id)
-user_roles       (user_uuid, role_id)
+roles            (id, name UNIQUE, is_system_role, is_owner, created_at)
+permissions      (key PK, description)            -- e.g. "messages.delete", "members.kick"
+role_permissions (role_id, permission_key)
+account_roles    (account_id, role_id, granted_at)
 ```
+
+**No `server_id`.** One deployment is one server with one database, the same scoping accounts use
+(§5.1) — a column that always held the single `server_instances` id would buy nothing. Adding it is
+a straightforward migration if one database ever hosts several servers.
+
+**`account_roles`, not `user_roles`** — "account" is the term the rest of the server uses.
+
+#### 5.3.1 Roles are data; permission keys are code
+
+The dynamic half is roles: create them, name them, choose their permissions, assign them to members,
+all at runtime. The **set of permission keys is fixed in code** (`Authorization/Permission.cs`) and
+seeded into `permissions` by migration.
+
+This is deliberate, and it is the one place the system is not dynamic. A permission key means
+something only where the server checks it, so a key an administrator could invent would appear in
+the role editor and grant nothing — a bug wearing flexibility's clothes. Adding a permission is a
+code change made in the same PR as the enforcement point that gives it meaning.
+
+Seeding the catalogue into the database is what lets a client render a role editor without shipping
+its own copy of the list.
+
+Keys are dotted `area.action` strings and are **stable forever once shipped** — they are stored in
+`role_permissions`, so renaming one silently strips that permission from every role holding it.
+
+#### 5.3.2 The Owner's authority is a flag, not rows
+
+The Owner role is seeded with **no `role_permissions` rows at all**. It holds every permission
+implicitly, decided during resolution (`PermissionResolver`), specifically so there is nothing an
+administrator can uncheck to reduce it.
+
+Authority comes from the `is_owner` flag, never from the role's name. Renaming the Owner is allowed
+and costs it nothing — a server that calls its Owner "Founder" still has an Owner. Nothing in the
+server may branch on a role's name.
+
+At most one Owner *role* exists, held by a partial unique index on `is_owner`, so the rule survives
+a code path that bypasses the mutation layer.
+
+#### 5.3.3 Where the invariants are enforced
+
+In the **mutation layer** (`RoleManager`), not in the UI — a client is free to be wrong about what
+it offers.
+
+- **A server keeps at least one account holding Owner.** Checked before revoking an Owner
+  assignment. This binds *every* caller, an Owner acting on themselves included: a server with no
+  Owner has nobody able to appoint one, so it is not a permission anyone can hold.
+- **System roles cannot be deleted.** A server with no Member role has nothing to give a new member.
+- **The Owner role's permission set cannot be edited** (see §5.3.2). Non-Owner system roles *can*
+  be — an operator may legitimately want a more or less powerful Admin.
+- **Unknown permission keys are refused outright**, not silently dropped, so a typo cannot quietly
+  produce a role granting less than the caller believes.
+
+`RoleManager` deliberately does **not** check whether the caller is permitted to act. That is
+`PermissionResolver`'s job at the endpoint. Mixing the two would make the invariants above depend on
+the caller's permissions, which is exactly what they must not do.
+
+#### 5.3.4 Resolution
+
+Effective permissions are the **union** of what every role an account holds grants, deduplicated —
+a permission granted by two roles resolves once. An account with no roles, and an account that does
+not exist, both resolve to no permissions: absence is denial, never an error, since a caller gating
+an action has nothing to do with the difference.
+
+`PermissionResolver` is scoped and caches nothing, so a role change takes effect on the next
+resolution without a restart. Note that a long-lived scope — a SignalR connection holding one open
+(§6) — resolves against the state its `DbContext` first saw.
 
 ### 5.4 Persistence (PostgreSQL)
 - **ORM: EF Core** with Npgsql. Chosen as the path of least resistance in .NET — migrations are
@@ -721,4 +798,5 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 
 Settled, and no longer open: test framework (**xUnit**), solution format (**`.slnx`**), target
 framework (**`net10.0`**), client MVVM library (**CommunityToolkit.Mvvm**), server ORM
-(**EF Core**, §5.4), and client local storage (**SQLite**, §9.5).
+(**EF Core**, §5.4), client local storage (**SQLite**, §9.5), and whether permission keys are data
+or code (**code**, §5.3.1).
