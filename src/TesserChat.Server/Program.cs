@@ -5,6 +5,7 @@ using TesserChat.Server.Auditing;
 using TesserChat.Server.Auth;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
+using TesserChat.Server.Realtime;
 using TesserChat.Server.Setup;
 
 // `hash-join-secret <password>` prints the value for Connection:JoinSecretHash and exits, so an
@@ -29,6 +30,7 @@ builder.AddAccounts();
 builder.AddRolesAndPermissions();
 builder.AddAuditing();
 builder.AddChallengeAuth();
+builder.AddRealtime();
 builder.AddSetup();
 
 var app = builder.Build();
@@ -65,6 +67,10 @@ app.MapGet("/auth/session", (ClaimsPrincipal principal) =>
         ? Results.Unauthorized()
         : Results.Ok(new { accountId = accountId.Value.ToString("D") });
 }).RequireAuthorization();
+
+// The real-time transport room chat and presence both ride on (§6). Mapped after authentication
+// is in the pipeline, since the hub authorises its own handshake.
+app.MapRealtime();
 
 await app.RunAsync();
 
