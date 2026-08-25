@@ -90,11 +90,11 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **201 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **252 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
-admission, and its own first-run setup. **None of it is reachable by a client**: there are no
-endpoints beyond `/health`, no authentication, and no chat transport, so every service below is
-exercised only in-process and by tests.
+admission, its own first-run setup, and the challenge-response half of login. **None of it is
+reachable by a client**: there are no endpoints beyond `/health`, nothing issues a session token,
+and there is no chat transport, so every service below is exercised only in-process and by tests.
 
 | Piece | State |
 |---|---|
@@ -109,22 +109,26 @@ exercised only in-process and by tests.
 | First-run setup and Owner assignment (§5.6) | done |
 | Docker image and compose pairing (§5.6) | done |
 | Audit log for role changes and setup (§5.5) | done — kicks, bans, deletions still owed (§5.5.4) |
+| Challenge-response login: signed payload, nonce issue/consume (§4.7) | done — no endpoint, no token yet |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
 
 **Nothing built so far is reachable from outside the process.** There are no HTTP or SignalR
-endpoints beyond `/health`, no auth, and therefore no way for a client to register, log in, or
-manage roles. `AccountRegistrar`, `PermissionResolver`, and `RoleManager` are internal classes
-exercised by tests. Exposing them is auth's job (§4.7) and the transport work in §6 — and note that
-neither "role management endpoints" nor "role management UI" is currently tracked as an issue.
+endpoints beyond `/health`, so there is no way for a client to register, log in, or manage roles.
+`AccountRegistrar`, `PermissionResolver`, `RoleManager`, and `ChallengeAuthenticator` are internal
+classes exercised by tests. `ChallengeAuthenticator` can authenticate an identity today but nothing
+calls it over the wire and nothing turns its result into a session token — that is #13, then the
+transport work in §6. Note that neither "role management endpoints" nor "role management UI" is
+currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
 proof for the MVVM split, not a design for the real window (§9.2).
 
-`ProtocolVersion` is the one piece of real protocol surface that exists. It is referenced by neither
-client nor server yet; wiring the version exchange into the connect handshake is part of building
-auth (§4.7), and `MinimumSupported` must be bumped in the same PR as any breaking wire-format change.
+`ProtocolVersion` is still referenced by neither client nor server; wiring the version exchange into
+the connect handshake is part of the client login work (#14). It now has company: the login payload
+(§4.7.1) is real wire format too, and **`MinimumSupported` must be bumped in the same PR as any
+breaking change to either**.
 
 ## 1. What TesserChat Is
 
@@ -191,10 +195,12 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       Program.cs                 #   minimal-host entry point; /health endpoint
       appsettings.example.json   #   tracked template — real appsettings.json is gitignored
       /Persistence               #   EF Core: DbContext, entities, options (§5.4)
-        /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
+        /Migrations              #     scaffolded by `dotnet ef`; hand-edited only for SQL
+                                 #     EF cannot express (§5.5.1), with a comment saying why
       /Accounts                  #   registration, public key storage, admission (§5.1, §5.2)
       /Setup                     #   first-run setup and Owner assignment (§5.6)
       /Auditing                  #   append-only moderation/admin log (§5.5)
+      /Auth                      #   challenge issue/verify, nonce lifecycle (§4.7)
       /Authorization             #   roles, permission catalogue, resolution (§5.3)
       /Properties
         launchSettings.json
@@ -206,6 +212,8 @@ Six projects — three under `/src`, one mirrored test project each under `/test
       /ViewModels                #   ViewModelBase, MainWindowViewModel
     /TesserChat.Shared           # Wire-protocol DTOs + crypto helpers, no dependencies
       ProtocolVersion.cs
+      /Auth                      #   LoginChallenge — the signed login payload (§4.7.1)
+      /Identity                  #   IdentityKeyPair, AccountId, PublicIdentity (§4.1)
   /tests
     /TesserChat.Server.Tests     # HealthEndpointTests.cs
     /TesserChat.Client.Tests     # MainWindowViewModelTests.cs
@@ -336,13 +344,124 @@ server-side — a malicious server must not be able to force a remote wipe.
   authentication-tag check on decrypt *is* the "wrong passphrase" signal — no separate check needed.
 
 ### 4.7 Login (Challenge-Response)
-1. Client requests a nonce from the server it's connecting to.
-2. Nonce is short-TTL, single-use, and scoped to that server's identity (server ID/hostname mixed
-   into what gets signed, so a signature can't be replayed against a different server).
-3. Client signs the nonce with its Ed25519 private key.
-4. Server verifies against the stored public key for that account, issues a session token (JWT).
-5. Token authenticates subsequent REST calls and the SignalR hub connection (via SignalR's
-   `AccessTokenProvider`, standard ASP.NET Core JWT bearer flow).
+
+A client proves it holds an identity's private key without that key ever leaving the device. Built
+as `LoginChallenge` (`TesserChat.Shared`) and `ChallengeAuthenticator` (server).
+
+1. Client requests a challenge from the server it's connecting to.
+2. Server returns a **32-byte random nonce**, its own **server id**, and an expiry.
+3. Client signs the payload below with its Ed25519 private key.
+4. Server consumes the nonce, verifies the signature, and resolves the signing key to an account.
+5. Server issues a session token (JWT, #13) authenticating subsequent REST calls and the SignalR
+   hub connection (via SignalR's `AccessTokenProvider`, standard ASP.NET Core JWT bearer flow).
+
+Steps 1–4 are built. Step 5 is not: `ChallengeAuthenticator` returns an authenticated account id
+and nothing turns that into a token yet. Neither step is reachable over HTTP — there are no auth
+endpoints (§0.4).
+
+#### 4.7.1 The Signed Payload Is Shared, Frozen Wire Format
+
+```
+"tesserchat:login:v1"  (19 bytes)  domain separator
+server id              (16 bytes)  big-endian UUID
+nonce                  (32 bytes)  the challenge
+```
+
+Concatenated with no delimiter or length prefix — every field is fixed width, so there is no
+parsing to get wrong and no ambiguity to exploit.
+
+`LoginChallenge` lives in `TesserChat.Shared` because **client and server must produce
+byte-identical payloads**, and the only way to guarantee that is for both to call the same method.
+Two implementations of "the same" format drift the moment one side adds a field, and the symptom is
+every login failing with a signature error that names nothing.
+
+**Changing this layout or the context string is a breaking protocol change** and must bump
+`ProtocolVersion.MinimumSupported` in the same PR. The domain separator is what stops a signature
+over a bare nonce from also being a valid login signature, so anything that ever gets an identity
+to sign attacker-chosen bytes is not thereby a login oracle.
+
+#### 4.7.2 Scoped to the Server UUID, Not the Hostname
+
+The server's `ServerInstance.Id` (§5.6) goes into the signed payload — **not** its hostname, despite
+this section previously saying "server ID/hostname".
+
+This is the security property the whole flow exists for. Without it, a malicious server could
+collect a client's signature and replay it against a *different* server to log in as that user.
+Binding the target into the signed bytes means a signature produced for one server verifies nowhere
+else.
+
+The UUID rather than the hostname because the UUID is written once at setup and never changes,
+whereas a hostname changes behind a reverse proxy, on a port change, and whenever a self-hoster
+moves domains. Binding to a hostname would break every existing client's login on each of those,
+with a signature error that points at nothing.
+
+The tradeoff, stated plainly: **a client learns the server's UUID from the same server it is
+authenticating to**, so on first contact it cannot independently verify it reached the server it
+meant to. That is trust-on-first-use, closed later by pinning the id client-side (#14) — and a
+hostname would not have closed it either, since the client learns which host it dialled from its own
+configuration but learns nothing about who answers.
+
+**An unconfigured server cannot authenticate anyone**, because it has no id to bind to. It issues no
+challenges and refuses every login. The way into a fresh server is setup (§5.6), not login.
+
+#### 4.7.3 Single Use Is Enforced by Postgres, Not by the Code Above It
+
+Challenges live in a `login_nonces` table, keyed by the nonce value itself. Consuming one is a
+**single conditional UPDATE** — set `consumed_at` where the value matches, is unconsumed, and has
+not expired:
+
+- Postgres serialises the matching rows, so of two requests presenting the same nonce at the same
+  instant, **exactly one sees a row affected**. A read-then-write would let both pass their check
+  before either wrote — and would pass every test that did not run the two concurrently.
+- Expiry is part of that same statement rather than checked around it, so there is no window in
+  which an expiring nonce is spent by one path and rejected by another.
+- It survives a restart, and it still holds if a self-hoster ever runs two instances against one
+  database. An in-process cache would give the same answers right up until either happened.
+
+**The nonce is consumed before the signature is verified.** Spending it first means a wrong
+signature burns the challenge rather than leaving it available to retry — an attacker gets one
+attempt per nonce, not unlimited attempts against a nonce that stays valid until it expires. A
+legitimate client that fumbles asks for another, costing it one round trip.
+
+Spent rows are kept, not deleted: a consumed row is what makes a replay distinguishable from a nonce
+that never existed. A sweep (`Auth:ChallengeRetention`, default 15 minutes past expiry) clears them
+eventually. The sweep is housekeeping, not correctness — an unswept nonce is still unusable, because
+consuming one checks expiry itself.
+
+**The nonce table is not an audit record.** Challenges are issued to anyone who asks, before any
+identity is proven, so the table says only that a challenge was handed out — never who logged in.
+Authenticated actions belong in the audit log (§5.5).
+
+#### 4.7.4 Requesting a Challenge Reveals Nothing
+
+A caller does not say who they are to get a nonce. Challenge issuance therefore **cannot be used to
+test whether a public key is registered here**, which is the same enumeration boundary §5.2 draws
+around admission and §8.2 draws around presence. Who signed is established from the signature, at
+verification.
+
+The same reasoning applies to failures. Internally `LoginStatus` distinguishes an expired challenge,
+a replayed one, a bad signature, and an unregistered key — those distinctions are for the server's
+own logs. **The endpoint that eventually surfaces this (#13) must answer every failed login with one
+undifferentiated rejection.** Telling a stranger their nonce expired rather than that their key is
+unknown turns login into an oracle for which public keys are registered here.
+
+The account lookup runs last, after the signature verifies, so an unregistered key and a bad
+signature do the same work in the same order and the refusal reveals nothing by its timing.
+
+#### 4.7.5 Configuration
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Auth:ChallengeLifetime` | `00:02:00` | How long a client has to sign a challenge |
+| `Auth:ChallengeRetention` | `00:15:00` | How long spent/expired challenges are kept before sweeping |
+
+Two minutes is long enough for a slow link and a device waking up, short enough that a captured
+challenge is worthless by the time it could be used. Signing is a local operation taking
+microseconds, so this is almost entirely network and interface latency — it is configurable for the
+self-hoster on a genuinely bad link, not because the default needs tuning.
+
+Retention is deliberately non-zero so a replay arriving just after expiry still meets a row and is
+refused as spent, rather than looking like a nonce that never existed.
 
 ## 5. Server
 
@@ -545,8 +664,19 @@ resolution without a restart. Note that a long-lived scope — a SignalR connect
   PascalCase would have to be double-quoted in every query an operator ever hand-writes against
   their own database. Changing this later is a rename migration across every table, so it is
   settled here.
-- The schema today is one table, `server_instances`, holding this deployment's own id — enough to
-  have something real to migrate and round-trip. The first-run setup flow (§5.6) extends it.
+- The schema today, one table per concern:
+
+  | Table | Holds | Section |
+  |---|---|---|
+  | `server_instances` | this deployment's own id and name; at most one row | §5.6.3 |
+  | `accounts` | registered public keys, display names | §5.1 |
+  | `roles`, `permissions`, `role_permissions`, `account_roles` | the dynamic role system | §5.3 |
+  | `audit_entries` | moderation and administration actions; append-only | §5.5 |
+  | `login_nonces` | outstanding and spent login challenges; transient | §4.7.3 |
+
+  `login_nonces` is the only transient table so far. It is swept on a retention window rather than
+  kept, and it is deliberately **not** an audit record — challenges are issued before any identity
+  is proven, so the table says nothing about who logged in.
 - Integration tests run against a **real Postgres**, not an in-memory provider: the in-memory
   provider does not enforce constraints or model Postgres behaviour, so it would pass on schemas
   Postgres rejects. Testcontainers, Linux-only in CI — see §0.3 for why, and for the guard against
@@ -637,7 +767,9 @@ reinterprets every existing row.
 - Config lives in `appsettings.json`, standard ASP.NET Core configuration layering (env var
   overrides for container deployments). That file is gitignored; `appsettings.example.json` is the
   tracked template and must be updated whenever a new key is introduced (§3.2).
-- The Docker image is not built yet (#28). Setup itself is (`src/TesserChat.Server/Setup/`).
+- Both are built: the image and its Compose pairing (§5.6.0), and setup itself
+  (`src/TesserChat.Server/Setup/`). Setup is not yet reachable over HTTP — there is no endpoint for
+  a client to complete it through, only the service the tests drive (§0.4).
 
 #### 5.6.1 Setup is unauthenticated, so it runs exactly once
 
@@ -995,8 +1127,16 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
   the floor still owes. The remaining question is whether anything beyond moderation and
   administration belongs in it.
 - Whether room messages ever get an edit/delete history model, or hard-delete only.
+- Session token lifetime, and whether a refresh token exists at all or re-running
+  challenge-response *is* the refresh path (#13). Re-running it is cheap — one round trip, no
+  refresh-token storage, no second credential to leak — and is the likely answer, but it should be
+  written down as a decision rather than arrived at by default.
+- Whether a client pins a server's id on first connect (§4.7.2). Without pinning, first contact is
+  trust-on-first-use; with it, a changed id is a visible warning rather than a silent one. Belongs
+  with the client login work (#14).
 
 Settled, and no longer open: test framework (**xUnit**), solution format (**`.slnx`**), target
 framework (**`net10.0`**), client MVVM library (**CommunityToolkit.Mvvm**), server ORM
-(**EF Core**, §5.4), client local storage (**SQLite**, §9.5), and whether permission keys are data
-or code (**code**, §5.3.1).
+(**EF Core**, §5.4), client local storage (**SQLite**, §9.5), whether permission keys are data
+or code (**code**, §5.3.1), and what a login signature is scoped to (**the server's UUID, not its
+hostname**, §4.7.2).

@@ -1,6 +1,7 @@
 using TesserChat.Server;
 using TesserChat.Server.Accounts;
 using TesserChat.Server.Auditing;
+using TesserChat.Server.Auth;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
 using TesserChat.Server.Setup;
@@ -26,6 +27,7 @@ builder.AddPersistence();
 builder.AddAccounts();
 builder.AddRolesAndPermissions();
 builder.AddAuditing();
+builder.AddChallengeAuth();
 builder.AddSetup();
 
 var app = builder.Build();
