@@ -90,7 +90,7 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **347 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **382 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
 admission, its own first-run setup, and login end to end. **A client can now authenticate, connect,
 and hold a room conversation**: login is reachable over HTTP, returns a session token, that token
@@ -118,6 +118,7 @@ come.
 | SignalR hub, authenticated connections, connection registry (§6) | done — carries no messages yet |
 | Rooms, membership, and permanent message history (§5.4.1) | done |
 | Room chat over the hub: post, subscribe, fetch history, live fan-out (§6.4) | done |
+| Client local store: SQLite, migrations, servers, tokens, contacts, DM history (§9.5.1) | done — nothing drives it yet |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -128,8 +129,8 @@ from outside is everything around it — registration has no endpoint, so an acc
 database only through first-run setup or a test, and rooms have no creation path over the hub, since
 that needs the permission check room management will bring. `AccountRegistrar`,
 `PermissionResolver`, and `RoleManager` remain internal classes exercised only by tests. There is
-also still no client: the Avalonia app is a placeholder shell, so the only thing driving the hub
-today is the test suite. Note that neither "role management
+also still no client driving it: the Avalonia app is a placeholder shell whose only real component
+is its local store (§9.5.1), so the only thing exercising the hub today is the test suite. Note that neither "role management
 endpoints" nor "role management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
@@ -160,7 +161,7 @@ nothing depends on it yet. Only the *in* rows are load-bearing for a build right
 | Server | ASP.NET Core (`Microsoft.NET.Sdk.Web`), SignalR for real-time | in / SignalR planned |
 | Server persistence | PostgreSQL via **EF Core** + Npgsql, snake_case naming (§5.4) | in |
 | Client | Avalonia UI **12.1.x**, MVVM via **CommunityToolkit.Mvvm** 8.4.x | in |
-| Client local storage | OS-native secure storage (private keys) + SQLite/LiteDB (everything else local) | planned |
+| Client local storage | OS-native secure storage (private keys) + **SQLite** via `Microsoft.Data.Sqlite` (everything else, §9.5.1) | SQLite in / secure storage planned |
 | Crypto | NSec (libsodium binding) — Ed25519 signing, X25519 ECDH, XChaCha20-Poly1305 AEAD | planned |
 | Voice (future) | SIPSorcery (WebRTC/RTP/ICE/DTLS-SRTP in pure C#) | planned |
 | Client packaging/updates | Velopack — per-OS installers + auto-update, GitHub Releases as source | planned |
@@ -1334,6 +1335,71 @@ Two separate local stores, split by sensitivity:
   native dependency it brings is not a new cost, since NSec already introduced one.
 - Known-servers list should support **export/import as a plain file** — user-initiated, no service
   involved, same philosophy as key file transfer.
+
+#### 9.5.1 The Local Database
+
+`LocalStore` (`TesserChat.Client/Storage`) over SQLite via `Microsoft.Data.Sqlite`. Four tables:
+`servers`, `session_tokens`, `contacts`, `direct_messages`.
+
+**What may go in this file.** Everything stored here is one of three things: public (a contact's
+keys), low-value and short-lived (a session token), or already plaintext on this machine by
+necessity (decrypted DM history). Nothing here can impersonate the user — that is the whole point
+of the split in §9.5, and the test of whether a new column belongs is which of those three it is.
+Identity keys are none of them and live in OS-native secure storage (§4.2).
+
+**Cached session tokens are the one entry worth justifying**, since a bearer token in a plain file
+looks like the weak point. §4.7.6 already settled it: there is no refresh token, tokens expire in
+12 hours, and re-running challenge-response costs one round trip against a key the client already
+holds. So a token lifted from this file stops working on its own, and deleting the whole table
+loses nothing but a little latency. An expired row reads as absent rather than being returned for
+the caller to check — both cases have the same remedy, and a caller that forgot would send a token
+the server is certain to reject.
+
+**Migrations are hand-written and append-only.** The server uses EF Core because a self-hoster's
+database is long-lived and operator-managed (§5.4); this one is a local cache the app owns
+outright, so EF would buy a heavyweight dependency and a startup cost for a schema of four tables.
+The cost of that choice is discipline: Velopack updates the app without the user thinking about it
+(§9.6), so an installed client runs these against a database an older version wrote. **Editing a
+shipped migration means two users at the same version have different schemas** — a schema change is
+always a new entry, never an edit to an existing one.
+
+Versioning uses SQLite's own `user_version` pragma rather than a table, which would itself need
+creating before it could be read. `CurrentVersion` is derived from how many migrations exist, so
+adding one cannot be half-done. Every outstanding migration runs in **one transaction with the
+version bump**, so a desktop app killed mid-upgrade — the normal case to design for, not an unlikely
+one — is left at its old version rather than half-migrated.
+
+A database from a **newer** build is refused with a typed exception rather than opened. That is what
+a version rollback produces, and reading a future schema with today's queries would either fail
+obscurely or quietly write data the newer build then misreads. The remedy is to update the app, not
+to discard the data, and only a distinguishable error lets the UI say so.
+
+**DM history is keyed by the peer's public key, never by the relaying server.** §7.3 requires a
+conversation to read as one continuous thread even after the pair move to a different shared server,
+and querying by peer is what delivers that rather than a merge at display time. `received_via` is
+recorded for display and diagnosis only, and is deliberately not part of what identifies a message
+or its thread.
+
+**Dedup is on the sender's message id, enforced by a unique index.** §7.4 fans a DM out to every
+shared server, so the same message arrives more than once and must be shown once; it also notes that
+two distinct messages can share a millisecond, which is why the timestamp is not the key. The index
+does the work rather than a read-then-write, which would be a race between two arrivals of the same
+message. A caller still acknowledges a duplicate, or the server that queued it keeps it forever.
+
+**Foreign keys are enabled per connection.** SQLite defaults them off for backwards compatibility,
+so the cascade that clears a server's cached token when the server is removed holds only because
+`LocalStore` turns them on every time it opens a connection.
+
+Blocking lives on the contact row rather than in a separate list, so a key cannot be
+known-and-unblocked in one table and blocked in another. A key that is not a contact at all is not
+blocked, which is the same answer as an explicitly unblocked contact — §7.5.2 routes an unknown
+sender to the first-contact prompt, and the caller distinguishes the two by asking whether the
+contact exists.
+
+The database lives under the OS per-user application-data directory rather than beside the
+executable, which Velopack replaces on update (§9.6).
+
+**Not yet built:** export and import of the known-servers list as a plain file, which §9.5 calls for.
 
 ### 9.6 Distribution & Auto-Update
 
