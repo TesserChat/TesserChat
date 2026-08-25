@@ -90,11 +90,12 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **252 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **271 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
-admission, its own first-run setup, and the challenge-response half of login. **None of it is
-reachable by a client**: there are no endpoints beyond `/health`, nothing issues a session token,
-and there is no chat transport, so every service below is exercised only in-process and by tests.
+admission, its own first-run setup, and login end to end. **A client can now authenticate**: login
+is reachable over HTTP and returns a session token that authenticates further calls. There is still
+no chat transport — no SignalR hub, no rooms, no DMs — so everything past authentication is
+exercised only in-process and by tests.
 
 | Piece | State |
 |---|---|
@@ -109,18 +110,19 @@ and there is no chat transport, so every service below is exercised only in-proc
 | First-run setup and Owner assignment (§5.6) | done |
 | Docker image and compose pairing (§5.6) | done |
 | Audit log for role changes and setup (§5.5) | done — kicks, bans, deletions still owed (§5.5.4) |
-| Challenge-response login: signed payload, nonce issue/consume (§4.7) | done — no endpoint, no token yet |
+| Challenge-response login: signed payload, nonce issue/consume (§4.7) | done |
+| `POST /auth/challenge`, `POST /auth/login`, `GET /auth/session` (§4.7) | done |
+| JWT session tokens: server-generated signing key, bearer validation (§4.7.6) | done — hub half awaits a hub (#16) |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
 
-**Nothing built so far is reachable from outside the process.** There are no HTTP or SignalR
-endpoints beyond `/health`, so there is no way for a client to register, log in, or manage roles.
-`AccountRegistrar`, `PermissionResolver`, `RoleManager`, and `ChallengeAuthenticator` are internal
-classes exercised by tests. `ChallengeAuthenticator` can authenticate an identity today but nothing
-calls it over the wire and nothing turns its result into a session token — that is #13, then the
-transport work in §6. Note that neither "role management endpoints" nor "role management UI" is
-currently tracked as an issue.
+**Authentication is reachable; nothing else is.** The three `/auth` endpoints are the only way in
+from outside the process, and what they get you is a token — there is still nowhere to send a
+message. Registration has no endpoint either, so an account reaches the database only through
+first-run setup or a test. `AccountRegistrar`, `PermissionResolver`, and `RoleManager` remain
+internal classes exercised only by tests. Note that neither "role management endpoints" nor "role
+management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
 proof for the MVVM split, not a design for the real window (§9.2).
@@ -352,12 +354,13 @@ as `LoginChallenge` (`TesserChat.Shared`) and `ChallengeAuthenticator` (server).
 2. Server returns a **32-byte random nonce**, its own **server id**, and an expiry.
 3. Client signs the payload below with its Ed25519 private key.
 4. Server consumes the nonce, verifies the signature, and resolves the signing key to an account.
-5. Server issues a session token (JWT, #13) authenticating subsequent REST calls and the SignalR
-   hub connection (via SignalR's `AccessTokenProvider`, standard ASP.NET Core JWT bearer flow).
+5. Server issues a session token (JWT) authenticating subsequent REST calls and the SignalR hub
+   connection (via SignalR's `AccessTokenProvider`, standard ASP.NET Core JWT bearer flow).
 
-Steps 1–4 are built. Step 5 is not: `ChallengeAuthenticator` returns an authenticated account id
-and nothing turns that into a token yet. Neither step is reachable over HTTP — there are no auth
-endpoints (§0.4).
+All five steps are built and reachable over HTTP: `POST /auth/challenge` and `POST /auth/login`,
+with `GET /auth/session` as the authenticated endpoint proving the bearer scheme is wired up. The
+hub half of step 5 is prepared but not exercised — no hub is mapped yet (#16), so the query-string
+token path (§4.7.6) has no route to authenticate against.
 
 #### 4.7.1 The Signed Payload Is Shared, Frozen Wire Format
 
@@ -441,9 +444,15 @@ verification.
 
 The same reasoning applies to failures. Internally `LoginStatus` distinguishes an expired challenge,
 a replayed one, a bad signature, and an unregistered key — those distinctions are for the server's
-own logs. **The endpoint that eventually surfaces this (#13) must answer every failed login with one
-undifferentiated rejection.** Telling a stranger their nonce expired rather than that their key is
-unknown turns login into an oracle for which public keys are registered here.
+own logs. **`POST /auth/login` answers every failed login with one undifferentiated rejection** —
+one status and one body, byte for byte, whether the nonce expired, the signature was wrong, the key
+is unregistered, or the request was malformed. Telling a stranger their nonce expired rather than
+that their key is unknown turns login into an oracle for which public keys are registered here.
+
+The same rule applies to a rejected *token*, not just a rejected login. ASP.NET Core's bearer
+middleware ordinarily returns `WWW-Authenticate: Bearer error="invalid_token",
+error_description="The token expired at ..."`, which distinguishes an expired token from a forged
+one and leaks the server's clock. `IncludeErrorDetails` is off, so both get the same bare 401.
 
 The account lookup runs last, after the signature verifies, so an unregistered key and a bad
 signature do the same work in the same order and the refusal reveals nothing by its timing.
@@ -454,6 +463,8 @@ signature do the same work in the same order and the refusal reveals nothing by 
 |---|---|---|
 | `Auth:ChallengeLifetime` | `00:02:00` | How long a client has to sign a challenge |
 | `Auth:ChallengeRetention` | `00:15:00` | How long spent/expired challenges are kept before sweeping |
+| `Auth:SessionLifetime` | `12:00:00` | How long a session token is accepted after issue |
+| `Auth:ClockSkew` | `00:00:30` | Tolerance when checking token expiry |
 
 Two minutes is long enough for a slow link and a device waking up, short enough that a captured
 challenge is worthless by the time it could be used. Signing is a local operation taking
@@ -462,6 +473,74 @@ self-hoster on a genuinely bad link, not because the default needs tuning.
 
 Retention is deliberately non-zero so a replay arriving just after expiry still meets a row and is
 refused as spent, rather than looking like a nonce that never existed.
+
+**There is no signing key to configure** — see §4.7.6.
+
+#### 4.7.6 Session Tokens
+
+A successful login returns a JWT. It authenticates REST calls via the `Authorization: Bearer`
+header, and will authenticate the SignalR hub connection the same way once one exists (#16).
+
+**No refresh token. Re-running challenge-response *is* the refresh path.** This is the settled
+answer to the question §12 previously left open, and it is settled on privacy grounds: a refresh
+token is a second long-lived bearer credential that has to be written to disk to be useful. The
+client already holds the identity key in OS-native secure storage (§4.2); a refresh token in SQLite
+(§9.5) would be a weaker credential in a weaker store, and revoking it would need server-side token
+state the server does not otherwise keep. Re-authenticating costs one round trip against a key the
+client already has, so the thing a refresh token buys is something this design gets for free.
+
+That is what makes a **12-hour lifetime** affordable. Tokens are stateless — the server records
+nothing about what it has issued, so it cannot revoke one — which means expiry is the only thing
+that ends a stolen token's usefulness. Long enough to cover a working day without re-authenticating
+mid-conversation; short enough that a token lifted off a client's disk is not a permanent key to
+that account. Raising it widens exactly that window; lowering it is nearly free.
+
+`Auth:ClockSkew` defaults to 30 seconds against a library default of five minutes. That default
+exists for federated deployments where issuer and validator are different machines; here they are
+the same process, so five minutes of grace on a 12-hour token is five extra minutes a stolen token
+works, bought for nothing.
+
+**The token carries one claim: the account id.** A JWT is signed, not encrypted — everything in it
+is readable by every proxy, log, and browser tool that sees the request. A display name would leak a
+member's chosen name to every hop. Roles would leak the server's administrative shape and, worse,
+would be a snapshot that keeps asserting a permission after it was withdrawn; roles are resolved per
+request from the database (§5.3), where a revocation takes effect immediately. The account id is not
+sensitive to carry — it is derived from a public key (§5.1) and already visible to everyone the
+account talks to. A `jti` is included so a future revocation list has something to name; nothing
+consumes it yet, and it cannot be added retroactively to tokens already issued.
+
+**The signing key is generated by the server, never configured.** It is 32 bytes of random material
+that no human needs to read, type, or choose, so asking an operator to supply one only creates ways
+for it to be weak, shared between deployments, committed to a repo, or left at whatever the example
+file suggested. The server makes its own on first use and keeps it in the `token_signing_keys`
+table — in the database rather than a mounted file, because the database is already the thing a
+deployment must back up. Restoring an older backup invalidates sessions issued since; clients
+recover by logging in again.
+
+The table holds rows rather than one overwritable value, with `retired_at` marking a superseded key.
+Nothing rotates keys yet, but rotation has to work by adding a row and letting the old key verify
+until the last token it signed expires — overwriting one key in place would log out every member at
+the instant it happened.
+
+**What a token is checked against, and why each check is there:**
+
+| Check | Refuses |
+|---|---|
+| Issuer and audience are this server's id | Tokens from other servers — routine on a network of independent deployments |
+| Signature, against the key named by `kid` | Tokens signed with anything this server does not hold |
+| `HS256` only | Algorithm confusion, including the `alg: none` family |
+| Expiry, within `Auth:ClockSkew` | Tokens past their lifetime |
+
+Issuer and audience are both the server's **id**, not a URL — the same reasoning as §4.7.2, so a
+server behind a renamed domain still validates its own tokens. They are enforced by validator
+*delegates* rather than by the `ValidateIssuer`/`ValidateAudience` flags, because the id is not
+known at startup on a server that has not completed setup yet. Note that a delegate runs regardless
+of whether its flag is set, so the delegates are the real control and the flags decide nothing here.
+
+**A token in the query string authenticates hub paths only.** SignalR cannot set an `Authorization`
+header on a WebSocket handshake, so its client sends the token as `?access_token=`. URLs end up in
+access logs, proxy logs, and browser history, so that form is accepted only for `/hubs/...` — an
+ordinary REST call cannot be authenticated by a token in a URL.
 
 ## 5. Server
 
@@ -1127,10 +1206,6 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
   the floor still owes. The remaining question is whether anything beyond moderation and
   administration belongs in it.
 - Whether room messages ever get an edit/delete history model, or hard-delete only.
-- Session token lifetime, and whether a refresh token exists at all or re-running
-  challenge-response *is* the refresh path (#13). Re-running it is cheap — one round trip, no
-  refresh-token storage, no second credential to leak — and is the likely answer, but it should be
-  written down as a decision rather than arrived at by default.
 - Whether a client pins a server's id on first connect (§4.7.2). Without pinning, first contact is
   trust-on-first-use; with it, a changed id is a visible warning rather than a silent one. Belongs
   with the client login work (#14).
@@ -1138,5 +1213,6 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 Settled, and no longer open: test framework (**xUnit**), solution format (**`.slnx`**), target
 framework (**`net10.0`**), client MVVM library (**CommunityToolkit.Mvvm**), server ORM
 (**EF Core**, §5.4), client local storage (**SQLite**, §9.5), whether permission keys are data
-or code (**code**, §5.3.1), and what a login signature is scoped to (**the server's UUID, not its
-hostname**, §4.7.2).
+or code (**code**, §5.3.1), what a login signature is scoped to (**the server's UUID, not its
+hostname**, §4.7.2), and whether session tokens have a refresh token (**no — re-running
+challenge-response is the refresh path**, §4.7.6).

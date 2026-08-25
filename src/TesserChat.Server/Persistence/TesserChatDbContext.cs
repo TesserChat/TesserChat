@@ -35,6 +35,8 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
 
     public DbSet<LoginNonce> LoginNonces => Set<LoginNonce>();
 
+    public DbSet<TokenSigningKey> TokenSigningKeys => Set<TokenSigningKey>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         base.OnModelCreating(modelBuilder);
@@ -251,6 +253,30 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             // The sweep deletes by expiry across the whole table (§4.7), which is the only query
             // here that is not a primary-key lookup.
             entity.HasIndex(challenge => challenge.ExpiresAt);
+        });
+
+        modelBuilder.Entity<TokenSigningKey>(entity =>
+        {
+            entity.HasKey(key => key.Id);
+
+            // The id travels in the token's `kid` header and is generated when the key is, so the
+            // server knows it without reading the row back.
+            entity.Property(key => key.Id).ValueGeneratedNever();
+
+            entity.Property(key => key.Secret)
+                .IsRequired()
+                .HasMaxLength(TokenSigningKey.SecretSize)
+                .IsFixedLength();
+
+            entity.Property(key => key.CreatedAt).IsRequired();
+
+            // Null means current. Nullable rather than a bool beside a timestamp, for the same
+            // reason as LoginNonce.ConsumedAt: two columns can disagree, one cannot.
+            entity.Property(key => key.RetiredAt);
+
+            // Choosing the signing key reads the newest unretired row on a cache miss, which is the
+            // only query here that is not a primary-key lookup by `kid`.
+            entity.HasIndex(key => key.CreatedAt);
         });
 
         SeedSystemRoles(modelBuilder);

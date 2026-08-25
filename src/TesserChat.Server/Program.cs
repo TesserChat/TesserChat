@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using TesserChat.Server;
 using TesserChat.Server.Accounts;
 using TesserChat.Server.Auditing;
@@ -40,9 +41,30 @@ await app.ApplyMigrationsAsync();
 // needs setting up (§5.6) — a self-hoster's first contact with a fresh container is `docker logs`.
 await app.ReportSetupStateAsync();
 
+// Order matters and is not the order they are declared in: authentication runs first so that
+// authorization has a principal to decide about.
+app.UseAuthentication();
+app.UseAuthorization();
+
 // Liveness probe for the Docker deployment path. Deliberately unauthenticated — it reports
 // nothing about the server's members, config, or identity.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+// Challenge-response login (§4.7). Both endpoints are necessarily anonymous — they are how a
+// member authenticates in the first place.
+app.MapLogin();
+
+// The authenticated caller's own account id. Small on purpose: it is what a client calls to
+// confirm a token works, and the first endpoint proving the bearer scheme is wired up. It tells a
+// caller only what they already proved by holding the token.
+app.MapGet("/auth/session", (ClaimsPrincipal principal) =>
+{
+    var accountId = principal.GetAccountId();
+
+    return accountId is null
+        ? Results.Unauthorized()
+        : Results.Ok(new { accountId = accountId.Value.ToString("D") });
+}).RequireAuthorization();
 
 await app.RunAsync();
 
