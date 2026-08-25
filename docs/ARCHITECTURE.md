@@ -207,6 +207,10 @@ Six projects — three under `/src`, one mirrored test project each under `/test
     /TesserChat.Shared.Tests     # ProtocolVersionTests.cs
   /.github/workflows/ci.yml
   /.config/dotnet-tools.json     # pinned local tools (dotnet-ef) — `dotnet tool restore`
+  Dockerfile                     # server image (§5.6)
+  compose.yaml                   # server + Postgres — the self-hosting path
+  .env.example                   # tracked template for compose config; .env is gitignored
+  .dockerignore
   Directory.Build.props          # solution-wide TFM + analyzer settings (§2.1)
   global.json                    # SDK pin
   .gitattributes                 # line-ending normalization across the 3 CI platforms

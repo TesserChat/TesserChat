@@ -1,0 +1,93 @@
+# TesserChat: server + Postgres, ready to run (ARCHITECTURE.md 5.6).
+#
+#   1. cp .env.example .env      and edit it — at minimum set POSTGRES_PASSWORD
+#   2. docker compose up -d
+#   3. docker compose logs -f tesserchat
+#
+# The log tells you whether the server still needs setting up, and warns if anyone who reaches it
+# first could claim ownership. Read TESSERCHAT_SETUP__OWNERPUBLICKEY in .env.example before
+# exposing this to a network you do not control.
+
+name: tesserchat
+
+services:
+  tesserchat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Once images are published, replace `build` above with:
+    #   image: ghcr.io/tesserchat/tesserchat-server:latest
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        # Waits for Postgres to accept connections, not merely to have started. Without this the
+        # server races the database on first boot — the single most common way this pairing fails.
+        condition: service_healthy
+
+    environment:
+      # Configuration is standard ASP.NET Core layering (§3.2): `__` is the separator for nested
+      # keys, so Database__MigrateOnStartup sets Database:MigrateOnStartup. Anything set here wins
+      # over appsettings.json.
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=${POSTGRES_DB:-tesserchat};Username=${POSTGRES_USER:-tesserchat};Password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+
+      # Schema is applied on startup, so an upgraded image migrates its own database rather than
+      # requiring a separate step (§5.4).
+      Database__MigrateOnStartup: "true"
+
+      # How new members are admitted (§5.2): Open, PasswordGated, or AllowlistOnly.
+      Connection__Mode: "${TESSERCHAT_CONNECTION__MODE:-Open}"
+      Connection__JoinSecretHash: "${TESSERCHAT_CONNECTION__JOINSECRETHASH:-}"
+
+      # Who may claim ownership at first-run setup (§5.6). Strongly recommended before exposing
+      # this server — see .env.example.
+      Setup__OwnerPublicKey: "${TESSERCHAT_SETUP__OWNERPUBLICKEY:-}"
+      Setup__ServerName: "${TESSERCHAT_SETUP__SERVERNAME:-}"
+
+    ports:
+      # Host:container. Bound to localhost by default so a fresh `docker compose up` is not
+      # immediately reachable from the network — put a reverse proxy in front and terminate TLS
+      # there. Change to "8080:8080" only once you have decided that is what you want.
+      - "127.0.0.1:${TESSERCHAT_PORT:-8080}:8080"
+
+    volumes:
+      # File and image attachments (#18). Declared now so that an operator who upgrades later does
+      # not discover their attachments lived in the container's writable layer and went away with
+      # it. Nothing writes here yet — attachments are not implemented.
+      - tesserchat-attachments:/var/lib/tesserchat/attachments
+
+  postgres:
+    # Pinned, matching what the integration tests run against. A major Postgres upgrade needs a
+    # dump and restore, so this should never float.
+    image: postgres:18-alpine
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-tesserchat}"
+      POSTGRES_USER: "${POSTGRES_USER:-tesserchat}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+
+    healthcheck:
+      # What `depends_on: service_healthy` above waits for.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tesserchat} -d ${POSTGRES_DB:-tesserchat}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    volumes:
+      # The database. Losing this loses every account, role, and message on the server, and there
+      # is no central service to recover any of it from — back this up.
+      #
+      # Mounted at /var/lib/postgresql, not the /var/lib/postgresql/data that Postgres 17 and
+      # earlier used. Postgres 18 places its data in a versioned subdirectory of this path so that
+      # a later major-version upgrade can run `pg_upgrade --link` without the two versions
+      # straddling a mount boundary. Mounting the old path makes 18 refuse to start.
+      - tesserchat-postgres:/var/lib/postgresql
+
+    # Not published. The server reaches Postgres over the compose network; exposing it on the host
+    # is an attack surface a self-hoster gains nothing from.
+
+volumes:
+  tesserchat-postgres:
+  tesserchat-attachments:

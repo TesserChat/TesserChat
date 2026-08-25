@@ -62,7 +62,12 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             entity.Property<bool>("singleton")
                 .HasColumnName("singleton")
                 .HasDefaultValueSql("true")
-                .ValueGeneratedOnAdd();
+                .ValueGeneratedOnAdd()
+                // Sentinel `true`: EF skips a property whose value equals the sentinel and lets the
+                // store default apply. Without this EF warns on every startup that it cannot tell
+                // an unset bool from a deliberate `false` — true here, but only because nothing
+                // ever sets this property, which is what the sentinel says.
+                .HasSentinel(true);
 
             entity.HasIndex("singleton")
                 .IsUnique()

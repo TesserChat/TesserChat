@@ -45,7 +45,10 @@ appsettings.json
 appsettings.*.json
 !appsettings.example.json
 *.env
+.env
 .env.*
+# Tracked template for compose, the same exception appsettings.example.json gets above.
+!.env.example
 
 # OS cruft
 .DS_Store

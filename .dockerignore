@@ -1,0 +1,30 @@
+# Keeps the build context small and, more importantly, keeps local secrets out of it: a real
+# appsettings.json or .env must never reach a layer.
+
+**/bin/
+**/obj/
+**/out/
+
+.git/
+.github/
+.vs/
+.vscode/
+.idea/
+
+# Local configuration and secrets (§3.2).
+**/appsettings.json
+**/appsettings.*.json
+!**/appsettings.example.json
+.env
+
+# Not part of a server deployment.
+src/TesserChat.Client/
+tests/
+docs/
+*.md
+TesserChat_logo.png
+
+# Docker's own files: changing them should not invalidate the build context.
+Dockerfile
+compose.yaml
+.dockerignore

@@ -12,10 +12,37 @@ Anyone can run a server on their own hardware. There is no central service, no c
 system, and no central directory — your identity is a public/private keypair you control, portable
 across every server you join.
 
-> **Status: early development.** The repository contains the project scaffolding, the core identity
-> primitives, and the server's persistence, account, authorization, and admission layers. Nothing is
-> reachable over a network yet — there is no authentication and no chat transport, so it is not yet
-> usable as a chat platform.
+> **Status: early development.** The server runs in Docker and manages accounts, roles, and how
+> people join. It has no authentication and no chat transport yet, so it is **not usable as a chat
+> platform** — there is nothing to connect a client to. The desktop client is a placeholder shell.
+
+## Running a server
+
+The server ships as a Docker image paired with a Postgres. You need Docker with Compose.
+
+```bash
+git clone https://github.com/TesserChat/TesserChat.git
+cd TesserChat
+cp .env.example .env      # then edit it — at minimum set POSTGRES_PASSWORD
+docker compose up -d
+docker compose logs -f tesserchat
+```
+
+The log tells you whether the server still needs setting up, and `/health` answers on
+`127.0.0.1:8080` once it is serving.
+
+**Before putting this on a public address**, read `TESSERCHAT_SETUP__OWNERPUBLICKEY` in
+[.env.example](.env.example). First-run setup is unauthenticated — there is no owner yet to
+authorize it — so unless you pin your own public key, whoever reaches the server first becomes its
+Owner. Pinning turns that from a race into a claim only your key can make. The server warns on every
+boot while no key is pinned.
+
+Two other things worth knowing:
+
+- The server speaks **plain HTTP** and is published to `127.0.0.1` only. Put a reverse proxy in
+  front and terminate TLS there.
+- The Postgres volume holds every account, role, and message. There is no central service to
+  recover any of it from, so **back it up**.
 
 ## Design
 
