@@ -8,7 +8,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
 using TesserChat.Server.Accounts;
 using TesserChat.Server.Auth;
+using TesserChat.Server.Persistence;
 using TesserChat.Server.Realtime;
+using TesserChat.Server.Rooms;
 using TesserChat.Server.Setup;
 using TesserChat.Server.Tests.Infrastructure;
 using TesserChat.Shared.Auth;
@@ -175,12 +177,74 @@ internal sealed class HubHost : IAsyncDisposable
     }
 
     /// <summary>Builds and starts a connection, asserting the handshake succeeded.</summary>
+    /// <remarks>
+    /// <para>
+    /// Waits for the connection to reach <see cref="ConnectionRegistry"/> before returning.
+    /// <c>StartAsync</c> completes when the handshake does, and <c>OnConnectedAsync</c> — which is
+    /// what registers the connection — runs separately, so a test asserting on the registry
+    /// immediately after connecting is racing it.
+    /// </para>
+    /// <para>
+    /// Handled here rather than in each test: the race is invisible when the callback happens to
+    /// win, so a test written without a wait passes until something unrelated shifts the timing.
+    /// Making the helper wait is what stops that being a trap the next connection test falls into.
+    /// </para>
+    /// </remarks>
     public async Task<HubConnection> ConnectAsync(string? token, bool useQueryString = true)
     {
         var connection = BuildConnection(token, useQueryString);
         await connection.StartAsync();
 
+        await WaitForAsync(() => Registry.FindAccount(connection.ConnectionId!) is not null);
+
         return connection;
+    }
+
+    /// <summary>Waits for a condition to hold, failing the test if it does not.</summary>
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(25);
+        }
+
+        Assert.True(condition(), "The expected state was not reached within the timeout.");
+    }
+
+    /// <summary>Runs an operation against the room manager in a fresh scope.</summary>
+    /// <remarks>
+    /// A scope per call, so a fact this asserts on is read from Postgres rather than from a change
+    /// tracker the hub happened to leave populated.
+    /// </remarks>
+    public async Task<T> RoomsAsync<T>(Func<RoomManager, Task<T>> operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        return await operation(scope.ServiceProvider.GetRequiredService<RoomManager>());
+    }
+
+    /// <summary>Creates a room directly, bypassing the hub.</summary>
+    /// <remarks>
+    /// Rooms have no creation path over the hub yet — that needs the permission check room
+    /// management will bring — so these tests set up their fixtures through the manager and
+    /// exercise the hub for what it does carry.
+    /// </remarks>
+    public async Task<Room> CreateRoomAsync(string name)
+    {
+        var (result, room) = await RoomsAsync(manager => manager.CreateRoomAsync(name));
+
+        Assert.True(result.Succeeded);
+        Assert.NotNull(room);
+
+        return room;
     }
 
     public async ValueTask DisposeAsync()

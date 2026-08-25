@@ -377,6 +377,17 @@ internal sealed class RoomManager(TesserChatDbContext context, TimeProvider time
             .OrderBy(room => room.Name)
             .ToListAsync(cancellationToken);
 
+    /// <summary>Whether a room exists.</summary>
+    /// <remarks>
+    /// Separate from reading one, because the caller that needs this only needs the answer: a
+    /// subscription and an empty history are both indistinguishable from a room that is not there,
+    /// so something has to be able to tell the two apart without loading the row.
+    /// </remarks>
+    public async Task<bool> RoomExistsAsync(
+        Guid roomId,
+        CancellationToken cancellationToken = default)
+        => await context.Rooms.AnyAsync(room => room.Id == roomId, cancellationToken);
+
     /// <summary>Whether an account is a member of a room.</summary>
     public async Task<bool> IsMemberAsync(
         Guid roomId,

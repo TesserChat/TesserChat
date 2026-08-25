@@ -90,14 +90,14 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **330 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **347 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
-admission, its own first-run setup, and login end to end. **A client can now authenticate and hold
-an authenticated real-time connection**: login is reachable over HTTP, returns a session token, and
-that token opens a SignalR connection the server resolves to an account. Rooms and their message
-history now exist as storage — rooms are created and joined, messages are written and paged back —
-but nothing carries them over the connection yet, so everything past the connection itself is
-exercised only in-process and by tests.
+admission, its own first-run setup, and login end to end. **A client can now authenticate, connect,
+and hold a room conversation**: login is reachable over HTTP, returns a session token, that token
+opens a SignalR connection the server resolves to an account, and over that connection a client can
+join rooms, post to them, read history, and receive messages other members post live. That is the
+first end-to-end path through the product. DMs, presence, and any client to drive it are still to
+come.
 
 | Piece | State |
 |---|---|
@@ -116,19 +116,20 @@ exercised only in-process and by tests.
 | `POST /auth/challenge`, `POST /auth/login`, `GET /auth/session` (§4.7) | done |
 | JWT session tokens: server-generated signing key, bearer validation (§4.7.6) | done |
 | SignalR hub, authenticated connections, connection registry (§6) | done — carries no messages yet |
-| Rooms, membership, and permanent message history (§5.4.1) | done — storage only, no hub delivery |
+| Rooms, membership, and permanent message history (§5.4.1) | done |
+| Room chat over the hub: post, subscribe, fetch history, live fan-out (§6.4) | done |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
 
-**The way in is authentication and a connection; there is still nothing to say over it.** The three
-`/auth` endpoints and the hub at `/hubs/tesserchat` are the only routes from outside the process. A
-client can log in, connect, and be told which account it is — and that is the end of it, because no
-hub method carries a message yet. Rooms are the clearest case: `RoomManager` will store a message
-and page a room's history back, and no client can reach any of it. Registration has no endpoint
-either, so an account reaches the database only through first-run setup or a test.
-`AccountRegistrar`, `PermissionResolver`, `RoleManager`, and `RoomManager` remain internal classes
-exercised only by tests. Note that neither "role management
+**The way in is the three `/auth` endpoints and the hub at `/hubs/tesserchat`**, and that is now
+enough to hold a conversation: log in, connect, join a room, and post. What is still unreachable
+from outside is everything around it — registration has no endpoint, so an account reaches the
+database only through first-run setup or a test, and rooms have no creation path over the hub, since
+that needs the permission check room management will bring. `AccountRegistrar`,
+`PermissionResolver`, and `RoleManager` remain internal classes exercised only by tests. There is
+also still no client: the Avalonia app is a placeholder shell, so the only thing driving the hub
+today is the test suite. Note that neither "role management
 endpoints" nor "role management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
@@ -1031,6 +1032,68 @@ online forever, which is the failure presence is most visible for.
 each instance seeing only its own connections — wrong for presence, though not yet wrong for
 anything built. Fixing it properly means a SignalR backplane rather than a smarter registry, so it
 is recorded here as a known limit rather than left to surface as a surprise when #23 lands.
+
+
+### 6.4 Room Chat Over the Hub
+
+`TesserChatHub` is a `Hub<IRoomClient>` — a typed hub, so the one call the server pushes
+(`MessagePosted`) is checked at compile time on both sides rather than matched by string name. A
+hub that pushed by name would let server and client disagree silently, the symptom being a message
+that simply never arrives.
+
+The methods a client calls: `PostMessage`, `FetchHistory`, `ListRooms`, `ListJoinedRooms`,
+`JoinRoom`, `LeaveRoom`, `SubscribeToRoom`, `UnsubscribeFromRoom`. Rooms are not *created* over the
+hub — that needs a permission check (`messages.delete` has a sibling waiting), so it belongs with
+room management rather than here.
+
+**Fan-out is SignalR groups, one per room, named `room:{id}`.** The server pushes to "everyone
+watching this room" without keeping a second record of who that is. Three things follow from the
+choice:
+
+- It is the mechanism §8.2 already specifies for presence, so room chat is not inventing a parallel
+  one. The two stay separable exactly as §6.1 requires: presence reads `ConnectionRegistry`, room
+  chat reads groups, and neither reaches the other.
+- Group names are **prefixed**, because presence puts `presence:{pubkey}` groups on this same
+  connection. Two features naming groups in one namespace is how a subscription to one silently
+  starts delivering the other.
+- The group is keyed by **room id, not name**. Names change (§5.4.1), and a rename must not strand
+  every connection watching the room in a group nothing publishes to any more.
+
+**Subscribing is not joining.** Membership is a stored fact about an account; a subscription is a
+fact about one connection, and SignalR drops it when that connection goes away. A reconnecting
+client re-subscribes to whatever it is showing — which is correct, since a connection that has gone
+should not count as watching anything. Neither implies the other: `JoinRoom` does not subscribe, and
+`SubscribeToRoom` does not join.
+
+**Membership is not required to subscribe or to read history**, for the same reason as §5.4.1: a
+member browsing a room they have not joined should see it live rather than a frozen snapshot they
+have to refresh. Posting is the thing membership gates, and that check lives in `RoomManager` where
+storage can enforce it — not here, where it would be a second copy free to drift.
+
+**Storage decides, then delivery follows.** `PostMessage` writes the message and pushes only if the
+write succeeded, so nothing is ever delivered that is not in the room's history. The reverse order
+would show members a message that a failed write then lost.
+
+**The push includes the sender's own connection.** That is what hands the client the server-assigned
+id and timestamp for what it just sent, so an optimistically-rendered message is reconciled against
+what was actually stored rather than guessed at. `PostMessage` also returns the stored message, so a
+client that is not subscribed still learns both.
+
+**There is no delivery queue for room chat.** A client that was offline catches up with
+`FetchHistory`, because the server already holds the history. The DM mailbox (§7.4) exists precisely
+because a DM has one recipient who may be unreachable and no server-side copy to catch up from —
+room chat has neither problem, and giving it a queue would be solving a problem it does not have.
+
+**Refusals are `HubException`.** Its message is the one kind of server-side exception detail SignalR
+relays to a caller; anything else arrives as an opaque "an error occurred", which would make a
+legitimate refusal indistinguishable from a server fault. Unlike a failed login (§4.7), these say
+plainly which rule was broken: the connection is already authenticated, and everything a refusal
+reveals — which room was named, whether the caller had joined it — the caller already knows.
+
+**The account is never a parameter.** No hub method takes a sender or author argument. The account
+comes from the validated principal (§6.2), so authorship cannot be claimed by the caller; the
+timestamp comes from the server's clock for the same reason. Both are shown to every member of the
+room, which is exactly why neither may be chosen by the member who posted.
 
 
 ## 7. Direct Messages (1:1, E2E Encrypted)
