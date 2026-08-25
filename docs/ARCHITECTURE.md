@@ -90,12 +90,13 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **292 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **330 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
 admission, its own first-run setup, and login end to end. **A client can now authenticate and hold
 an authenticated real-time connection**: login is reachable over HTTP, returns a session token, and
-that token opens a SignalR connection the server resolves to an account. There is still nothing to
-say over that connection — no rooms, no DMs — so everything past the connection itself is
+that token opens a SignalR connection the server resolves to an account. Rooms and their message
+history now exist as storage — rooms are created and joined, messages are written and paged back —
+but nothing carries them over the connection yet, so everything past the connection itself is
 exercised only in-process and by tests.
 
 | Piece | State |
@@ -115,6 +116,7 @@ exercised only in-process and by tests.
 | `POST /auth/challenge`, `POST /auth/login`, `GET /auth/session` (§4.7) | done |
 | JWT session tokens: server-generated signing key, bearer validation (§4.7.6) | done |
 | SignalR hub, authenticated connections, connection registry (§6) | done — carries no messages yet |
+| Rooms, membership, and permanent message history (§5.4.1) | done — storage only, no hub delivery |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -122,9 +124,11 @@ exercised only in-process and by tests.
 **The way in is authentication and a connection; there is still nothing to say over it.** The three
 `/auth` endpoints and the hub at `/hubs/tesserchat` are the only routes from outside the process. A
 client can log in, connect, and be told which account it is — and that is the end of it, because no
-hub method carries a message yet. Registration has no endpoint either, so an account reaches the
-database only through first-run setup or a test. `AccountRegistrar`, `PermissionResolver`, and
-`RoleManager` remain internal classes exercised only by tests. Note that neither "role management
+hub method carries a message yet. Rooms are the clearest case: `RoomManager` will store a message
+and page a room's history back, and no client can reach any of it. Registration has no endpoint
+either, so an account reaches the database only through first-run setup or a test.
+`AccountRegistrar`, `PermissionResolver`, `RoleManager`, and `RoomManager` remain internal classes
+exercised only by tests. Note that neither "role management
 endpoints" nor "role management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
@@ -755,6 +759,8 @@ resolution without a restart. Note that a long-lived scope — a SignalR connect
   | `roles`, `permissions`, `role_permissions`, `account_roles` | the dynamic role system | §5.3 |
   | `audit_entries` | moderation and administration actions; append-only | §5.5 |
   | `login_nonces` | outstanding and spent login challenges; transient | §4.7.3 |
+  | `token_signing_keys` | the server's own JWT signing keys | §4.7.6 |
+  | `rooms`, `room_memberships`, `room_messages` | room chat and its permanent history | §5.4.1 |
 
   `login_nonces` is the only transient table so far. It is swept on a retention window rather than
   kept, and it is deliberately **not** an audit record — challenges are issued before any identity
@@ -764,9 +770,75 @@ resolution without a restart. Note that a long-lived scope — a SignalR connect
   Postgres rejects. Testcontainers, Linux-only in CI — see §0.3 for why, and for the guard against
   those tests silently skipping.
 - Room messages: persisted permanently (so members can scroll history from before they joined).
+  See §5.4.1 for the model and the rules around it.
 - File/image attachments: in scope for v1 — store blobs on disk (or S3-compatible object storage
   later) with metadata rows in Postgres; don't put binary blobs directly in Postgres.
 - DM mailbox queue: see §7.4 — a *separate*, transient table, not the same as room message storage.
+
+#### 5.4.1 Rooms and Message History
+
+Three tables: `rooms`, `room_memberships`, and `room_messages`, with `RoomManager` as the only thing
+that writes them. Storage and delivery are deliberately separate — `RoomManager` never touches the
+hub, which is what lets room storage be tested without a transport and makes the hub method that
+follows a thin call onto it (§6.1).
+
+**Rooms are not end-to-end encrypted, and that is the point.** A room is open community chat and its
+messages arrive as plaintext, which is precisely what lets the server persist them and serve history
+to a member who was not present when they were posted. §7 is where encryption lives. Nothing about
+`room_messages` should be made to resemble a weaker version of a DM — the two are different
+subsystems because they answer different questions, not because one is behind.
+
+**Membership decides who may post, not what may be read.** §5.4 requires that a member can scroll
+history from before they joined, so joining a room cannot be the act that unlocks its past. History
+is readable to this server's members generally; `room_memberships` records participation. That
+distinction is why leaving a room is cheap: the row goes, the member's messages stay, and rejoining
+reconstructs nothing.
+
+Posting checks membership against the database on every call, not against what the client believes.
+A client still showing a room it has left and a client lying outright arrive identically, and both
+are refused.
+
+**Authorship and timestamps are the server's, never the caller's.** The author is the authenticated
+account already proven at login (§4.7) and the time is this server's clock. Both are shown to every
+member of the room, which is exactly why neither may be supplied by the member who posted. Authorship
+is the account UUID rather than the display name (§5.1), so a member renaming themselves renames
+them across all of history at once instead of stranding old messages under a name they no longer use.
+
+**History is ordered and paged by a sequence, not by a timestamp.** `room_messages.id` is a bigint
+identity column, and paging is keyset: a page carries the id of its oldest message as the cursor for
+the next page back. Two reasons, and both bite in practice:
+
+- Ordering by timestamp alone ties for messages posted in the same instant, leaving a pager no
+  stable cursor — the classic way scrolling back repeats a message or steps over one.
+- An `OFFSET` shifts under a client that pauses mid-scroll while new messages arrive. A keyset
+  cursor names a fixed point in the sequence and is unaffected by anything posted since.
+
+The id is server-assigned, so it also cannot be influenced by a client; a client-supplied ordering
+key would let one member insert themselves anywhere in a room's history. A page requests one row
+more than asked for, so "is there another page" is answered without a second query and without
+inferring it from a short page — a full page that happens to end the history is otherwise
+indistinguishable from one with more behind it.
+
+**Deleting an account that has posted is refused by the database.** `room_messages.author_account_id`
+is `ON DELETE RESTRICT`, unlike every other account foreign key in this schema, which cascades. A
+room's history is a shared record that other members' conversations refer to, and cascading here
+would let one member punch holes in everyone else's context by deleting their account. `RESTRICT`
+rather than `SET NULL` because §5.1 makes the author what authorship *means*, so a message with no
+author is not a state this table should be able to hold.
+
+That deliberately leaves account deletion blocked for anyone who has posted. Deciding what should
+happen instead — reassign to a tombstone account, or delete the messages as an explicit act — belongs
+with the kick and ban work (#48), where there is a caller to ask. A default chosen silently here
+would be the wrong place for it.
+
+Deleting a *room* does delete its messages, by cascade: the history belongs to the room and there is
+nowhere to read it once the room is gone. That is the one place room history is not permanent, and
+it takes a deliberate act to reach.
+
+**Still open** (§12): whether messages get an edit/delete history model or hard-delete only. Nothing
+in this schema decides it — there is no edit path and no delete path for an individual message yet,
+and `messages.delete` (§5.3) remains a permission key that nothing enforces. Whichever way it goes,
+it lands with the moderation work that first needs it, and is recorded here in that PR.
 
 ### 5.5 Audit Log
 All moderation/admin actions tied to the acting UUID (§5.1), with a timestamp and the affected
@@ -1268,7 +1340,8 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 - Exact audit log scope (which actions get logged) — §5.5.4 records what is logged today and what
   the floor still owes. The remaining question is whether anything beyond moderation and
   administration belongs in it.
-- Whether room messages ever get an edit/delete history model, or hard-delete only.
+- Whether room messages ever get an edit/delete history model, or hard-delete only. Still open — §5.4.1 records that nothing in the room schema decides it, and that it lands with the
+  moderation work that first needs it.
 - Whether a client pins a server's id on first connect (§4.7.2). Without pinning, first contact is
   trust-on-first-use; with it, a changed id is a visible warning rather than a silent one. Belongs
   with the client login work (#14).

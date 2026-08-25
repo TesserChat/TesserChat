@@ -6,6 +6,7 @@ using TesserChat.Server.Auth;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
 using TesserChat.Server.Realtime;
+using TesserChat.Server.Rooms;
 using TesserChat.Server.Setup;
 
 // `hash-join-secret <password>` prints the value for Connection:JoinSecretHash and exits, so an
@@ -31,6 +32,7 @@ builder.AddRolesAndPermissions();
 builder.AddAuditing();
 builder.AddChallengeAuth();
 builder.AddRealtime();
+builder.AddRooms();
 builder.AddSetup();
 
 var app = builder.Build();
