@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using TesserChat.Server.Auditing;
 using TesserChat.Server.Persistence;
 
 namespace TesserChat.Server.Authorization;
@@ -27,6 +28,7 @@ namespace TesserChat.Server.Authorization;
 internal sealed class RoleManager(
     TesserChatDbContext context,
     PermissionResolver resolver,
+    AuditLog auditLog,
     TimeProvider timeProvider)
 {
     /// <summary>
@@ -38,6 +40,7 @@ internal sealed class RoleManager(
     /// </remarks>
     public async Task<(RoleMutationResult Result, Role? Role)> CreateRoleAsync(
         string name,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         if (!TryNormaliseName(name, out var normalised))
@@ -60,6 +63,15 @@ internal sealed class RoleManager(
         };
 
         context.Roles.Add(role);
+
+        // Recorded before saving, so the entry shares the transaction with the change it describes
+        // (§5.5) — a committed change always has its entry, a rolled-back one leaves none.
+        auditLog.Record(
+            AuditAction.RoleCreated,
+            $"Created role '{normalised}'.",
+            actorAccountId,
+            targetRoleId: role.Id);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return (RoleMutationResult.Applied(), role);
@@ -76,6 +88,7 @@ internal sealed class RoleManager(
     public async Task<RoleMutationResult> RenameRoleAsync(
         Guid roleId,
         string name,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         if (!TryNormaliseName(name, out var normalised))
@@ -99,7 +112,15 @@ internal sealed class RoleManager(
             return RoleMutationResult.Refused(RoleMutationStatus.InvalidName);
         }
 
+        var previousName = role.Name;
         role.Name = normalised;
+
+        auditLog.Record(
+            AuditAction.RoleRenamed,
+            $"Renamed role '{previousName}' to '{normalised}'.",
+            actorAccountId,
+            targetRoleId: roleId);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return RoleMutationResult.Applied();
@@ -110,6 +131,7 @@ internal sealed class RoleManager(
     /// </summary>
     public async Task<RoleMutationResult> DeleteRoleAsync(
         Guid roleId,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         var role = await context.Roles.FirstOrDefaultAsync(r => r.Id == roleId, cancellationToken);
@@ -126,6 +148,15 @@ internal sealed class RoleManager(
         }
 
         context.Roles.Remove(role);
+
+        // The role id is recorded too, but the name is what keeps this readable once the role it
+        // names no longer exists.
+        auditLog.Record(
+            AuditAction.RoleDeleted,
+            $"Deleted role '{role.Name}'.",
+            actorAccountId,
+            targetRoleId: roleId);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return RoleMutationResult.Applied();
@@ -143,6 +174,7 @@ internal sealed class RoleManager(
     public async Task<RoleMutationResult> SetPermissionsAsync(
         Guid roleId,
         IReadOnlyCollection<string> permissionKeys,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(permissionKeys);
@@ -188,6 +220,25 @@ internal sealed class RoleManager(
             context.RolePermissions.Add(new RolePermission { RoleId = roleId, PermissionKey = added });
         }
 
+        // What changed, not what the set now is: "removed messages.delete" is the auditable fact,
+        // and the resulting set is derivable from the role itself.
+        var granted = requested.Except(current).Order().ToList();
+        var withdrawn = current.Except(requested).Order().ToList();
+
+        var summary = string.Join(
+            ' ',
+            new[]
+            {
+                granted.Count > 0 ? $"Granted {string.Join(", ", granted)}." : null,
+                withdrawn.Count > 0 ? $"Withdrew {string.Join(", ", withdrawn)}." : null,
+            }.Where(part => part is not null));
+
+        auditLog.Record(
+            AuditAction.RolePermissionsChanged,
+            $"Role '{role.Name}': {summary}",
+            actorAccountId,
+            targetRoleId: roleId);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return RoleMutationResult.Applied();
@@ -199,6 +250,7 @@ internal sealed class RoleManager(
     public async Task<RoleMutationResult> AssignRoleAsync(
         Guid accountId,
         Guid roleId,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         var accountExists = await context.Accounts.AnyAsync(account => account.Id == accountId, cancellationToken);
@@ -225,6 +277,18 @@ internal sealed class RoleManager(
             GrantedAt = timeProvider.GetUtcNow(),
         });
 
+        var roleName = await context.Roles
+            .Where(role => role.Id == roleId)
+            .Select(role => role.Name)
+            .SingleAsync(cancellationToken);
+
+        auditLog.Record(
+            AuditAction.RoleGranted,
+            $"Granted role '{roleName}'.",
+            actorAccountId,
+            targetAccountId: accountId,
+            targetRoleId: roleId);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return RoleMutationResult.Applied();
@@ -241,6 +305,7 @@ internal sealed class RoleManager(
     public async Task<RoleMutationResult> RevokeRoleAsync(
         Guid accountId,
         Guid roleId,
+        Guid? actorAccountId = null,
         CancellationToken cancellationToken = default)
     {
         var assignment = await context.AccountRoles
@@ -262,6 +327,14 @@ internal sealed class RoleManager(
         }
 
         context.AccountRoles.Remove(assignment);
+
+        auditLog.Record(
+            AuditAction.RoleRevoked,
+            $"Revoked role '{assignment.Role.Name}'.",
+            actorAccountId,
+            targetAccountId: accountId,
+            targetRoleId: roleId);
+
         await context.SaveChangesAsync(cancellationToken);
 
         return RoleMutationResult.Applied();

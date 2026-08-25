@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using TesserChat.Server.Accounts;
+using TesserChat.Server.Auditing;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
 using TesserChat.Server.Tests.Infrastructure;
@@ -57,6 +58,15 @@ internal sealed class AuthorizationHost : IAsyncDisposable
 
         await using var scope = _factory.Services.CreateAsyncScope();
         return await operation(scope.ServiceProvider.GetRequiredService<RoleManager>());
+    }
+
+    /// <summary>Runs an operation against the audit log in a fresh scope.</summary>
+    public async Task<T> AuditAsync<T>(Func<AuditLog, Task<T>> operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+
+        await using var scope = _factory.Services.CreateAsyncScope();
+        return await operation(scope.ServiceProvider.GetRequiredService<AuditLog>());
     }
 
     /// <summary>Runs an operation directly against the database in a fresh scope.</summary>

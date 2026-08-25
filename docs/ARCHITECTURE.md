@@ -90,9 +90,11 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **186 tests
-passing** across the three test projects. The identity, persistence, authorization, and admission
-layers are real; nothing is reachable over a network yet.
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **201 tests
+passing** across the three test projects. The server runs in Docker and manages accounts, roles,
+admission, and its own first-run setup. **None of it is reachable by a client**: there are no
+endpoints beyond `/health`, no authentication, and no chat transport, so every service below is
+exercised only in-process and by tests.
 
 | Piece | State |
 |---|---|
@@ -105,6 +107,8 @@ layers are real; nothing is reachable over a network yet.
 | Dynamic roles, permissions, and resolution (§5.3) | done |
 | Connection modes: open, password-gated, allowlist (§5.2) | done |
 | First-run setup and Owner assignment (§5.6) | done |
+| Docker image and compose pairing (§5.6) | done |
+| Audit log for role changes and setup (§5.5) | done — kicks, bans, deletions still owed (§5.5.4) |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
@@ -146,7 +150,7 @@ nothing depends on it yet. Only the *in* rows are load-bearing for a build right
 | Crypto | NSec (libsodium binding) — Ed25519 signing, X25519 ECDH, XChaCha20-Poly1305 AEAD | planned |
 | Voice (future) | SIPSorcery (WebRTC/RTP/ICE/DTLS-SRTP in pure C#) | planned |
 | Client packaging/updates | Velopack — per-OS installers + auto-update, GitHub Releases as source | planned |
-| Server deployment | Docker image, primary distribution path | planned |
+| Server deployment | Docker image, primary distribution path | in |
 | Config | `appsettings.json` (gitignored; `appsettings.example.json` is the tracked template) | in |
 | Testing | xUnit 2.9.x + `Microsoft.NET.Test.Sdk`, `coverlet.collector`, Testcontainers for Postgres | in |
 | License | MIT (`LICENSE` at repo root) | in |
@@ -190,6 +194,7 @@ Six projects — three under `/src`, one mirrored test project each under `/test
         /Migrations              #     scaffolded by `dotnet ef`; never hand-edited
       /Accounts                  #   registration, public key storage, admission (§5.1, §5.2)
       /Setup                     #   first-run setup and Owner assignment (§5.6)
+      /Auditing                  #   append-only moderation/admin log (§5.5)
       /Authorization             #   roles, permission catalogue, resolution (§5.3)
       /Properties
         launchSettings.json
@@ -552,8 +557,76 @@ resolution without a restart. Note that a long-lived scope — a SignalR connect
 - DM mailbox queue: see §7.4 — a *separate*, transient table, not the same as room message storage.
 
 ### 5.5 Audit Log
-All moderation/admin actions tied to the acting UUID. Exact scope of what's logged is open —
-default to logging role changes, kicks/bans, and message deletions at minimum.
+All moderation/admin actions tied to the acting UUID (§5.1), with a timestamp and the affected
+target. Built as `src/TesserChat.Server/Auditing/`, over an `audit_entries` table.
+
+#### 5.5.1 Append-only, enforced by the database
+
+Postgres rules reject UPDATE and DELETE on `audit_entries`:
+
+```sql
+CREATE RULE audit_entries_no_update AS ON UPDATE TO audit_entries DO INSTEAD NOTHING;
+CREATE RULE audit_entries_no_delete AS ON DELETE TO audit_entries DO INSTEAD NOTHING;
+```
+
+**In the database rather than by convention**, because an audit log a moderator can quietly edit is
+not an audit log — and the code that must not rewrite history is exactly the code most likely to
+grow a path that does. This holds against a future call site that forgets, and against anyone with a
+`psql` connection.
+
+Note the rules make such a write a **silent no-op**, not an error: a rule rewrites the statement, it
+does not raise. That is the wanted behaviour — a stray write changes nothing.
+
+Retention pruning, should it ever be wanted, means a migration that deliberately drops these rules
+and recreates them afterwards. That friction is the point: deleting an audit trail should be
+something someone writes down, not a `DELETE` someone runs.
+
+#### 5.5.2 The account ids are not foreign keys
+
+Every other join in this schema cascades on account deletion. `audit_entries` deliberately does not:
+if deleting an account erased the record of what it did, deleting an account would be the obvious
+way to cover tracks. The actor and target ids are stored as plain values, so the trail survives.
+
+An id whose account is gone stops resolving to a display name, which is exactly what a deleted
+account should look like. For the same reason `detail` carries a **denormalised human-readable
+summary** — "Granted role 'Moderator'" still means something after the Moderator role is deleted,
+whereas a dangling role id does not.
+
+`detail` must never carry a secret: it is readable by anyone holding `auditlog.read` (§5.3).
+
+#### 5.5.3 Recording is part of the action
+
+Entries are added to the caller's `DbContext` and saved by the caller's transaction, so a committed
+change always has its entry and a rolled-back one leaves none. An audit log written afterwards on a
+best-effort basis is missing exactly the entries that matter most.
+
+Consequently a **refused or no-op mutation records nothing** — granting a role an account already
+holds, or a revocation refused because it would remove the last Owner, did not happen and must not
+appear as though they had.
+
+#### 5.5.4 What is recorded today
+
+This section names role changes, kicks/bans, and message deletions as the floor. **Only role changes
+exist to be logged.** Kicks and bans are not built — `members.kick` and `members.ban` are defined
+and resolve, but nothing enforces them (#48). Message deletion is M3 (#17).
+
+Recorded now:
+
+| Action | Actor |
+|---|---|
+| `ServerSetUp` | none — setup precedes any account (§5.6) |
+| `RoleCreated`, `RoleRenamed`, `RoleDeleted` | the acting account |
+| `RolePermissionsChanged` | the acting account |
+| `RoleGranted`, `RoleRevoked` | the acting account |
+
+Still owed by the floor: kicks, bans, message deletions. Each arrives with the feature that makes it
+possible, in the same change as the call site that records it.
+
+A null actor means **"the server did this"**, never "we do not know who did this".
+
+`AuditAction` is stored as its member name, not an integer, so a row read directly in `psql` says
+`RoleGranted` rather than `3`. Member names are therefore frozen once shipped — renaming one
+reinterprets every existing row.
 
 ### 5.6 Setup & Deployment
 - Primary distribution: **Docker image** (`docker pull` as the target onboarding step).
@@ -918,7 +991,9 @@ Developer ID (macOS) before a public v1 launch, even if internal/beta builds ski
 
 ## 12. Open Decisions (flagged, not blocking)
 
-- Exact audit log scope (which actions get logged) — §5.5 sets a floor, not a ceiling.
+- Exact audit log scope (which actions get logged) — §5.5.4 records what is logged today and what
+  the floor still owes. The remaining question is whether anything beyond moderation and
+  administration belongs in it.
 - Whether room messages ever get an edit/delete history model, or hard-delete only.
 
 Settled, and no longer open: test framework (**xUnit**), solution format (**`.slnx`**), target

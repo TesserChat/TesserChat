@@ -2,6 +2,7 @@ using System.Buffers.Text;
 using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using TesserChat.Server.Auditing;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
 using TesserChat.Shared.Identity;
@@ -35,6 +36,7 @@ namespace TesserChat.Server.Setup;
 internal sealed class SetupService(
     TesserChatDbContext context,
     IOptionsMonitor<SetupOptions> options,
+    AuditLog auditLog,
     TimeProvider timeProvider,
     ILogger<SetupService> logger)
 {
@@ -132,6 +134,16 @@ internal sealed class SetupService(
                 SetUpAt = now,
                 SetUpByAccountId = identity.AccountId,
             });
+
+            // No actor: setup runs before any account exists to attribute it to (§5.5). The
+            // account that claimed ownership is the target, so the trail says who the server was
+            // handed to and when, which is the first thing worth being able to prove about it.
+            auditLog.Record(
+                AuditAction.ServerSetUp,
+                $"Server '{normalisedServerName}' set up; Owner assigned.",
+                actorAccountId: null,
+                targetAccountId: identity.AccountId,
+                targetRoleId: SystemRoles.OwnerId);
 
             await context.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);

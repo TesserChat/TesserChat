@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using TesserChat.Server.Auditing;
 using TesserChat.Server.Authorization;
 using TesserChat.Shared.Identity;
 
@@ -28,6 +29,8 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
     public DbSet<RolePermission> RolePermissions => Set<RolePermission>();
 
     public DbSet<AccountRole> AccountRoles => Set<AccountRole>();
+
+    public DbSet<AuditEntry> AuditEntries => Set<AuditEntry>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -190,6 +193,39 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             // Answering "what may this account do" reads every assignment it holds, so the index
             // matches the query rather than the key order.
             entity.HasIndex(assignment => assignment.AccountId);
+        });
+
+        modelBuilder.Entity<AuditEntry>(entity =>
+        {
+            entity.HasKey(audit => audit.Id);
+
+            // A sequence: the log is read in the order things happened, and a gap is evidence.
+            entity.Property(audit => audit.Id).ValueGeneratedOnAdd();
+
+            // Stored as the member name, so a row read in psql says RoleGranted rather than 3, and
+            // renumbering the enum can never reinterpret existing history.
+            entity.Property(audit => audit.Action)
+                .IsRequired()
+                .HasConversion<string>()
+                .HasMaxLength(64);
+
+            entity.Property(audit => audit.OccurredAt).IsRequired();
+
+            entity.Property(audit => audit.Detail)
+                .IsRequired()
+                .HasMaxLength(AuditEntry.DetailMaxLength);
+
+            // No foreign keys to accounts or roles, deliberately. Everything else in this schema
+            // cascades on account deletion; an audit trail that did would let a moderator erase
+            // what they did by deleting the account that did it. See AuditEntry.
+            entity.Property(audit => audit.ActorAccountId);
+            entity.Property(audit => audit.TargetAccountId);
+            entity.Property(audit => audit.TargetRoleId);
+
+            // "What did this account do, or have done to it" is the question an audit log is asked,
+            // so both directions are indexed rather than only the actor.
+            entity.HasIndex(audit => audit.ActorAccountId);
+            entity.HasIndex(audit => audit.TargetAccountId);
         });
 
         SeedSystemRoles(modelBuilder);
