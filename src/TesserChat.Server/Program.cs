@@ -1,3 +1,4 @@
+using TesserChat.Server;
 using TesserChat.Server.Accounts;
 using TesserChat.Server.Authorization;
 using TesserChat.Server.Persistence;
@@ -7,6 +8,13 @@ using TesserChat.Server.Setup;
 // operator setting up a password-gated server (§5.2) has a way to produce one without a
 // side-application. Handled before the host is built: it needs no database and no configuration.
 if (JoinSecretCommand.TryHandle(args, Console.Out, Console.Error, out var exitCode))
+{
+    return exitCode;
+}
+
+// `healthcheck` probes /health and exits — the container's HEALTHCHECK (§5.6). The runtime image
+// has no curl, so the probe is the app's own binary.
+if (HealthCheckCommand.TryHandle(args, Console.Error, out exitCode))
 {
     return exitCode;
 }
