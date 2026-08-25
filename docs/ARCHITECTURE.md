@@ -90,11 +90,12 @@ implementation.
 
 ### 0.4 What Is Actually Built Today
 
-The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **271 tests
+The solution builds clean (Release, 0 warnings under `TreatWarningsAsErrors`) with **292 tests
 passing** across the three test projects. The server runs in Docker and manages accounts, roles,
-admission, its own first-run setup, and login end to end. **A client can now authenticate**: login
-is reachable over HTTP and returns a session token that authenticates further calls. There is still
-no chat transport — no SignalR hub, no rooms, no DMs — so everything past authentication is
+admission, its own first-run setup, and login end to end. **A client can now authenticate and hold
+an authenticated real-time connection**: login is reachable over HTTP, returns a session token, and
+that token opens a SignalR connection the server resolves to an account. There is still nothing to
+say over that connection — no rooms, no DMs — so everything past the connection itself is
 exercised only in-process and by tests.
 
 | Piece | State |
@@ -112,17 +113,19 @@ exercised only in-process and by tests.
 | Audit log for role changes and setup (§5.5) | done — kicks, bans, deletions still owed (§5.5.4) |
 | Challenge-response login: signed payload, nonce issue/consume (§4.7) | done |
 | `POST /auth/challenge`, `POST /auth/login`, `GET /auth/session` (§4.7) | done |
-| JWT session tokens: server-generated signing key, bearer validation (§4.7.6) | done — hub half awaits a hub (#16) |
+| JWT session tokens: server-generated signing key, bearer validation (§4.7.6) | done |
+| SignalR hub, authenticated connections, connection registry (§6) | done — carries no messages yet |
 | `TesserChat.Shared.ProtocolVersion` (`Current`/`MinimumSupported`/`IsSupported`) | done, not yet wired to anything |
 | Avalonia client booting a Dark-variant Fluent theme with a bound `MainWindowViewModel` | placeholder shell |
 | Everything else in this document | not started |
 
-**Authentication is reachable; nothing else is.** The three `/auth` endpoints are the only way in
-from outside the process, and what they get you is a token — there is still nowhere to send a
-message. Registration has no endpoint either, so an account reaches the database only through
-first-run setup or a test. `AccountRegistrar`, `PermissionResolver`, and `RoleManager` remain
-internal classes exercised only by tests. Note that neither "role management endpoints" nor "role
-management UI" is currently tracked as an issue.
+**The way in is authentication and a connection; there is still nothing to say over it.** The three
+`/auth` endpoints and the hub at `/hubs/tesserchat` are the only routes from outside the process. A
+client can log in, connect, and be told which account it is — and that is the end of it, because no
+hub method carries a message yet. Registration has no endpoint either, so an account reaches the
+database only through first-run setup or a test. `AccountRegistrar`, `PermissionResolver`, and
+`RoleManager` remain internal classes exercised only by tests. Note that neither "role management
+endpoints" nor "role management UI" is currently tracked as an issue.
 
 `MainWindowViewModel` currently exposes only `Title` and a placeholder `Greeting` — it is a wiring
 proof for the MVVM split, not a design for the real window (§9.2).
@@ -897,6 +900,66 @@ connection:
 - **Room chat** — plaintext to the server (rooms are not E2E encrypted, by design — see §7).
 - **Presence** — see §8.2, implemented via SignalR **Groups** (`presence:{pubkey}`), not custom
   fan-out bookkeeping.
+
+Built as `TesserChatHub` and `ConnectionRegistry` (`TesserChat.Server/Realtime`), mapped at
+`/hubs/tesserchat`. The hub owns the connection lifecycle and nothing else; room chat (#17) and
+presence (#23) layer on top of it.
+
+### 6.1 One Transport, Separable Responsibilities
+
+Putting both responsibilities on one connection is a **connection-count decision, not a reason to
+write them together**. A client already holds a connection open to every saved server at once
+(§8.2), so a second connection per server would double that for no benefit.
+
+What keeps them separable is that the hub does not own any feature state. It authenticates a
+connection, resolves it to an account, and records it in `ConnectionRegistry`. Presence reads that
+registry; room chat does not. Neither has to know the other exists, and neither is reached through
+the other.
+
+### 6.2 Connections Are Authenticated at the Handshake
+
+`[Authorize]` is on the hub class, so it applies to **the connection**, not to individual methods.
+An unauthenticated client is refused during the handshake and never reaches a hub method.
+
+The alternative — authorising each method — would let a connection establish first and be rejected
+only when it called something. That leaves a connected-but-anonymous connection in existence, which
+is precisely the state presence would then have to decide what to do about.
+
+**The account comes from the validated principal, never from the client.** By the time
+`OnConnectedAsync` runs, the bearer token has been validated (§4.7.6), so the account id is this
+server's own statement about who connected rather than a claim the client made. A connection whose
+principal carries no usable account id is aborted: that should be unreachable, since this server
+only signs tokens carrying one, so reaching it means the server issued something malformed.
+
+**The hub is mapped under `/hubs/` deliberately.** That prefix is what §4.7.6 allows a query-string
+token for, and a SignalR client cannot set an `Authorization` header on a WebSocket handshake — so
+a hub mapped anywhere else would be unreachable by a real client over WebSockets. This is not
+caught by a connection-level test, because the HTTP transports also send a header that would
+authenticate the request regardless; it is asserted directly against the negotiate endpoint instead.
+
+### 6.3 An Account Has Many Connections, Not One
+
+`ConnectionRegistry` maps an account to a **set** of connections, because two things in this design
+produce more than one:
+
+- §8.2 has the client connected to every saved server simultaneously.
+- §4.4 has one identity reused across devices, by design.
+
+So "is this account online" is "does it hold at least one connection", and a disconnect only takes
+an account offline when it was the last one. `Add` and `Remove` each report whether they caused
+that transition, so presence can announce a change rather than re-deriving one per connection
+event. Two racing disconnects report the account offline exactly once.
+
+Cleanup runs on **every** disconnect, clean or not — SignalR calls `OnDisconnectedAsync` for a
+client that closed politely and for one whose network vanished, with only the exception argument
+differing. A registry that cleaned up only after polite disconnects would show dropped clients
+online forever, which is the failure presence is most visible for.
+
+**The registry is in-memory, and therefore per-instance.** A two-instance deployment would have
+each instance seeing only its own connections — wrong for presence, though not yet wrong for
+anything built. Fixing it properly means a SignalR backplane rather than a smarter registry, so it
+is recorded here as a known limit rather than left to surface as a surprise when #23 lands.
+
 
 ## 7. Direct Messages (1:1, E2E Encrypted)
 
