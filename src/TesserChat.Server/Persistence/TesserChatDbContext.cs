@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using TesserChat.Server.Auditing;
 using TesserChat.Server.Authorization;
+using TesserChat.Shared.Auth;
 using TesserChat.Shared.Identity;
 
 namespace TesserChat.Server.Persistence;
@@ -31,6 +32,8 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
     public DbSet<AccountRole> AccountRoles => Set<AccountRole>();
 
     public DbSet<AuditEntry> AuditEntries => Set<AuditEntry>();
+
+    public DbSet<LoginNonce> LoginNonces => Set<LoginNonce>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -226,6 +229,28 @@ internal sealed class TesserChatDbContext(DbContextOptions<TesserChatDbContext> 
             // so both directions are indexed rather than only the actor.
             entity.HasIndex(audit => audit.ActorAccountId);
             entity.HasIndex(audit => audit.TargetAccountId);
+        });
+
+        modelBuilder.Entity<LoginNonce>(entity =>
+        {
+            // The nonce value is the key. A surrogate id would let the same bytes be inserted
+            // twice, which is precisely what this table exists to make impossible (§4.7).
+            entity.HasKey(challenge => challenge.Value);
+
+            entity.Property(challenge => challenge.Value)
+                .HasMaxLength(LoginChallenge.NonceSize)
+                .IsFixedLength();
+
+            entity.Property(challenge => challenge.IssuedAt).IsRequired();
+            entity.Property(challenge => challenge.ExpiresAt).IsRequired();
+
+            // Null means outstanding, so this is deliberately nullable rather than a bool plus a
+            // timestamp that could disagree with it.
+            entity.Property(challenge => challenge.ConsumedAt);
+
+            // The sweep deletes by expiry across the whole table (§4.7), which is the only query
+            // here that is not a primary-key lookup.
+            entity.HasIndex(challenge => challenge.ExpiresAt);
         });
 
         SeedSystemRoles(modelBuilder);
